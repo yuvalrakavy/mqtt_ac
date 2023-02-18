@@ -1,0 +1,47 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'mqtt_ac'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=mqtt_ac",
+                    "--package=mqtt_ac"
+                ],
+                "filter": {
+                    "name": "mqtt_ac",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'mqtt_ac'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=mqtt_ac",
+                    "--package=mqtt_ac",
+                    "--",
+                    " --nocapture"
+                ],
+                "filter": {
+                    "name": "mqtt_ac",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
