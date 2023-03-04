@@ -13,7 +13,8 @@ pub enum ToCoolmasterMessage {
 
 #[derive(Debug)]
 pub enum ToMqttPublisherMessage {
-    PublishUnitState(UnitState),
-    PublishUnitsState(Vec<UnitState>),
+    Error(String),
+    UnitState(UnitState),
+    UnitsState(Vec<UnitState>),
 }
 

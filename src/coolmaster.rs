@@ -1,13 +1,12 @@
 use tokio::net::TcpStream;
 use tokio::io::{BufReader, AsyncWriteExt, AsyncBufReadExt};
 use tokio::sync::mpsc::{Sender, Receiver};
-use tokio::sync::oneshot::Receiver as OneshotReceiver;
 
-use log::{info, debug, error};
+use log::{info, error};
 
 use crate::error::CoolmasterError;
 use crate::messages::{ToCoolmasterMessage, ToMqttPublisherMessage};
-use crate::ac_unit::{UnitState, self, FanSpeed};
+use crate::ac_unit::{UnitState, self};
 
 
 pub struct Coolmaster {
@@ -17,35 +16,16 @@ pub struct Coolmaster {
 #[allow(dead_code)]
 impl Coolmaster {
     pub async fn coolmaster_worker(
-        host: &str, port: Option<u16>,
-        to_coolmaster_channel: Receiver<ToCoolmasterMessage>,
-        to_mqtt_publisher_channel: Sender<ToMqttPublisherMessage>,
-        terminate_request: OneshotReceiver<()>
-    )  -> Result<(), CoolmasterError>{
+        coolmaster_address: &str,
+        mut to_coolmaster_channel: Receiver<ToCoolmasterMessage>,
+        to_mqtt_publisher_channel: Sender<ToMqttPublisherMessage>
+    ) {
         let mut coolmaster = Coolmaster::new();
 
-        tokio::select! {
-            _ = terminate_request => {
-                info!("Coolmaster worker received terminate request");
-            }
-
-            _ = coolmaster.do_work(host, port, to_coolmaster_channel, to_mqtt_publisher_channel) => {
-
-            }
-        };
-
-        Ok(())
-    }
-
-    async fn do_work(&mut self,
-        host: &str, port: Option<u16>,
-        mut to_coolmaster_channel: Receiver<ToCoolmasterMessage>,
-        to_mqtt_publisher_channel: Sender<ToMqttPublisherMessage>,
-    ) -> Result<(), CoolmasterError> {
         loop {      // Work loop
 
             loop {  // Reconnect loop
-                let connect_result = self.connect(host, port).await;
+                let connect_result = coolmaster.connect(coolmaster_address).await;
 
                 match connect_result {
                     Ok(_) => {
@@ -55,6 +35,7 @@ impl Coolmaster {
 
                     Err(e) => {
                         info!("Coolmaster worker failed to connect to coolmaster controller: {}", e);
+                        to_mqtt_publisher_channel.send(ToMqttPublisherMessage::Error(format!("{:#?}", e))).await.map_err(|_| CoolmasterError::SendToMqttPublisherChannelFailed).unwrap();
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         info!("Coolmaster worker retrying to connect to coolmaster controller");
                     }
@@ -67,14 +48,22 @@ impl Coolmaster {
                 match message {
                     None => {
                         info!("Coolmaster worker received None message");
-                        return Ok(());
                     }
 
                     Some(message) => {
-                        if let Err(e) = self.handle_message(&message, &to_mqtt_publisher_channel).await {
-                            error!("Coolmaster worker failed to handle message: {:#?} - error {:#?}", message, e);
-                            self.stream = None;     // Drop the connection, and reconnect
-                            break;
+                        if let Err(e) = coolmaster.handle_message(&message, &to_mqtt_publisher_channel).await {
+                            if let CoolmasterError::CoolmasterCommandError(ref coolmaster_error_message) = e {
+                                error!("Coolmaster worker failed to handle message: {:#?}: {}", message, coolmaster_error_message);
+
+                                to_mqtt_publisher_channel.send(
+                                    ToMqttPublisherMessage::Error(format!("Failed to handle {:#?} - {}", message, coolmaster_error_message))
+                                ).await.map_err(|_| CoolmasterError::SendToMqttPublisherChannelFailed).unwrap();
+                            }
+                            else {
+                                error!("Coolmaster worker failed to handle message: {:#?} - error {:#?} - disconnecting from coolmaster", message, e);
+                                coolmaster.stream = None;     // Drop the connection, and reconnect
+                                break;
+                            }
                         }
                     }
                 }
@@ -88,8 +77,19 @@ impl Coolmaster {
         }
     }
 
-    async fn connect(&mut self, host: &str, port: Option<u16>) -> Result<(), CoolmasterError> {
-        let port = port.unwrap_or(10102);
+    fn split_host_port(host_port: &str) -> Result<(String, u16), CoolmasterError> {
+        let mut host_port_parts = host_port.split(':');
+
+        let host = host_port_parts.next().ok_or_else(|| CoolmasterError::InvalidCoolmasterAddress(host_port.to_string()))?;
+        let port_string = host_port_parts.next().unwrap_or("10102");
+        let port = port_string.parse::<u16>()
+            .map_err(|_| CoolmasterError::InvalidCoolmasterPort(host_port.to_string()))?;
+
+        Ok((host.to_string(), port))
+    }
+
+    async fn connect(&mut self, host: &str) -> Result<(), CoolmasterError> {
+        let (host, port) = Coolmaster::split_host_port(host)?;
         let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
         self.stream = Some(stream);
 
@@ -109,12 +109,12 @@ impl Coolmaster {
 
             ToCoolmasterMessage::PublishUnitState(unit) => {
                 let unit_state = self.get_unit_state(unit).await?;
-                let _ = to_mqtt_publisher_channel.send(ToMqttPublisherMessage::PublishUnitState(unit_state)).await;
+                let _ = to_mqtt_publisher_channel.send(ToMqttPublisherMessage::UnitState(unit_state)).await;
             },
 
             ToCoolmasterMessage::PublishUnitsState => {
                 let units_state = self.get_units_state().await?;
-                let _ = to_mqtt_publisher_channel.send(ToMqttPublisherMessage::PublishUnitsState(units_state)).await;
+                let _ = to_mqtt_publisher_channel.send(ToMqttPublisherMessage::UnitsState(units_state)).await;
             },
             ToCoolmasterMessage::SetUnitMode(unit, mode) => self.set_unit_mode(unit, mode.clone()).await?,
             ToCoolmasterMessage::SetFanSpeed(unit, fan_speed) => self.set_unit_fan_speed(unit, fan_speed).await?,
@@ -242,7 +242,7 @@ mod tests {
     const COOLMASTER_ADDRESS: &str = "10.0.1.70";
 
     fn set_logger() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Debug).try_init();
     }
 
     #[tokio::test]
@@ -251,10 +251,9 @@ mod tests {
 
         let (to_coolmaster_tx, to_coolmaster_rx) = tokio::sync::mpsc::channel(10);
         let (to_mqtt_tx, mut to_mqtt_rx) = tokio::sync::mpsc::channel(10);
-        let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel::<()>();
 
-        tokio::spawn(async move {
-            _ = super::Coolmaster::coolmaster_worker(COOLMASTER_ADDRESS, None, to_coolmaster_rx, to_mqtt_tx, terminate_rx).await;
+        let handle = tokio::spawn(async move {
+            super::Coolmaster::coolmaster_worker(COOLMASTER_ADDRESS, to_coolmaster_rx, to_mqtt_tx).await;
         });
 
         tokio::spawn(async move {
@@ -270,14 +269,27 @@ mod tests {
 
         to_coolmaster_tx.send(super::ToCoolmasterMessage::PublishUnitsState).await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        terminate_tx.send(()).unwrap();
+        handle.abort();
+        println!("Test done");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_split_host_port() {
+        let (host, port) = super::Coolmaster::split_host_port("10.0.1.70").unwrap();
+        assert_eq!(host, "10.0.1.70");
+        assert_eq!(port, 10102);
+
+        let (host, port) = super::Coolmaster::split_host_port("10.0.1.70:7777").unwrap();
+        assert_eq!(host, "10.0.1.70");
+        assert_eq!(port, 7777);
     }
 
     #[tokio::test]
     #[ignore]
     async fn test_send_command_get_reply() {
         let mut coolmaster = super::Coolmaster::new();
-        coolmaster.connect(COOLMASTER_ADDRESS, None).await.unwrap();
+        coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
         let reply = coolmaster.command("ls").await.unwrap();
 
         println!("Reply: {}", reply);
@@ -287,7 +299,7 @@ mod tests {
     #[ignore]
     async fn test_send_bad_command_get_reply() {
         let mut coolmaster = super::Coolmaster::new();
-        coolmaster.connect(COOLMASTER_ADDRESS, None).await.unwrap();
+        coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
         let reply = coolmaster.command("abracadabra").await;
 
         println!("Reply: {:?}", reply);
@@ -298,7 +310,7 @@ mod tests {
     #[ignore]
     async fn test_send_command_empty_reply_body() {
         let mut coolmaster = super::Coolmaster::new();
-        coolmaster.connect(COOLMASTER_ADDRESS, None).await.unwrap();
+        coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
 
         let reply = coolmaster.command("on L7.400").await.unwrap();
         assert!(reply.is_empty());
@@ -311,7 +323,7 @@ mod tests {
     #[ignore]
     async fn test_get_unit_state() {
         let mut coolmaster = super::Coolmaster::new();
-        coolmaster.connect(COOLMASTER_ADDRESS, None).await.unwrap();
+        coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
         let state = coolmaster.get_unit_state("L7.400").await.unwrap();
 
         println!("State: {:?}", state);
@@ -324,7 +336,7 @@ mod tests {
     #[ignore]
     async fn test_get_unit_states() {
         let mut coolmaster = super::Coolmaster::new();
-        coolmaster.connect(COOLMASTER_ADDRESS, None).await.unwrap();
+        coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
         let states = coolmaster.get_units_state().await.unwrap();
 
         println!("States: {:?}", states);

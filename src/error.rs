@@ -5,6 +5,12 @@ pub enum CoolmasterError {
     #[error("Connection error")]
     ConnectionError(#[from] std::io::Error),
 
+    #[error("Invalid coolmaster address")]
+    InvalidCoolmasterAddress(String),
+
+    #[error("Invalid coolmaster port")]
+    InvalidCoolmasterPort(String),
+
     #[error("Not connected")]
     NotConnected,
 
@@ -19,4 +25,7 @@ pub enum CoolmasterError {
 
     #[error("Invalid temperature")]
     InvalidTemperature(String),
+
+    #[error("Send to mqtt publisher channel failed")]
+    SendToMqttPublisherChannelFailed,
 }

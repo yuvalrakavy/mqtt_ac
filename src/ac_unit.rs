@@ -1,9 +1,11 @@
 
 use core::fmt::{Display, Formatter};
+use serde::{Serialize, Deserialize};
+
 use crate::error::CoolmasterError;
 
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FanSpeed {
     VLow,
     Low,
@@ -13,7 +15,7 @@ pub enum FanSpeed {
     Auto,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationMode {
     Cool,
     Heat,
@@ -22,7 +24,7 @@ pub enum OperationMode {
     Auto,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UnitState {
     pub unit: String,
     pub power: bool,
