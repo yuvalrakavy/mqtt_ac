@@ -47,7 +47,7 @@ impl MqttPublisher {
                         },
 
                         ToMqttPublisherMessage::Error(error_message) => {
-                            let topic = format!("Aircondition/{}/Error", self.controller_name);
+                            let topic = format!("Aircondition/Error/{}", self.controller_name);
                             debug!("Publishing to topic {} error_message: {}", topic, error_message);
                             self.mqtt_client.publish(topic, rumqttc::QoS::AtLeastOnce, true, serde_json::to_vec(&error_message).unwrap()).await.unwrap();
                         }
@@ -72,7 +72,7 @@ impl MqttPublisher {
     }
 
     async fn publish_unit_state(&mut self, unit_state: &UnitState) {
-        let topic = format!("Aircondition/{}/State/{}", self.controller_name, unit_state.unit);
+        let topic = format!("Aircondition/State/{}/{}", self.controller_name, unit_state.unit);
         debug!("Publishing to topic {} unit_state: {:#?}", topic, unit_state);
         self.mqtt_client.publish(topic, rumqttc::QoS::AtLeastOnce, true, serde_json::to_vec(unit_state).unwrap()).await.unwrap();
     }

@@ -43,7 +43,7 @@ impl Service {
         mqtt_client.publish(&last_will_topic, QoS::AtLeastOnce, true, "true".as_bytes()).await.unwrap();
 
         // Subscribe to commands
-        mqtt_client.subscribe(format!("Aircondition/{controller_name}/Command"), QoS::AtLeastOnce).await.unwrap();
+        mqtt_client.subscribe(format!("Aircondition/Command/{controller_name}"), QoS::AtLeastOnce).await.unwrap();
         (mqtt_client, event_loop)
     }
 }
