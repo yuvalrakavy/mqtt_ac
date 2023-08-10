@@ -32,7 +32,8 @@ impl Service {
     }
 
     async fn connect_to_mqtt_broker(mqtt_broker: &str, controller_name: &str) -> (AsyncClient, EventLoop) {
-        let mut mqtt_options = MqttOptions::new(controller_name, mqtt_broker, 1883);
+        let client_id = format!("Aircondition-{}", controller_name);
+        let mut mqtt_options = MqttOptions::new(client_id, mqtt_broker, 1883);
         let last_will_topic = format!("Aircondition/Active/{controller_name}");
         let last_will = LastWill::new(&last_will_topic, "false".as_bytes(), QoS::AtLeastOnce, true);
         mqtt_options.set_keep_alive(Duration::from_secs(5)).set_last_will(last_will);
