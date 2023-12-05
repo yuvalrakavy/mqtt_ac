@@ -4,6 +4,7 @@
         "Coolmaster",
         "filt",
         "fspeed",
+        "rsplit",
         "rumqttc"
     ]
 }

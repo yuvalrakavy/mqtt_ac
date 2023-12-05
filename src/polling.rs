@@ -1,7 +1,8 @@
-use tokio::{sync::mpsc::Sender, time::Duration};
+use tokio::time::Duration;
+use async_channel::Sender;
 use crate::messages::ToCoolmasterMessage;
 
-use log::{debug};
+use log::debug;
 
 pub async fn polling_worker(
     poll_period: Duration,

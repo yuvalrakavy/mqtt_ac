@@ -2,8 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CoolmasterError {
-    #[error("Connection error")]
-    ConnectionError(#[from] std::io::Error),
+    // #[error("Connection error")]
+    // ConnectionError(#[from] std::io::Error),
 
     #[error("Invalid coolmaster address")]
     InvalidCoolmasterAddress(String),
@@ -13,9 +13,6 @@ pub enum CoolmasterError {
 
     #[error("Not connected")]
     NotConnected,
-
-    #[error("Invalid reply")]
-    InvalidReply(#[from] std::string::FromUtf8Error),
 
     #[error("Coolmaster error: {0}")]
     CoolmasterCommandError(String),
@@ -28,4 +25,13 @@ pub enum CoolmasterError {
 
     #[error("Send to mqtt publisher channel failed")]
     SendToMqttPublisherChannelFailed,
+
+    #[error("In context of '{0}'")]
+    Context(String),
+}
+
+#[derive(Debug, Error)]
+pub enum MqttError {
+    #[error("In context of '{0}'")]
+    Context(String),
 }

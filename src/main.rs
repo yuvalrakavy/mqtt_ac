@@ -21,7 +21,16 @@ async fn main() {
         opt polling: u16=4, desc: "Polling period (in seconds)";
     }.parse_or_exit();
 
-    env_logger::init();
+    let d = tracing_init::TracingInit::builder("mqtt_ac")
+        .log_to_file(true)
+        .log_to_server(true)
+        .log_file_prefix("ac")
+        .log_file_path("logs")
+        .init().map(|t| format!("{t}")).unwrap();
+
+    println!("Logging: {}", d);
+
+    error_stack::Report::set_color_mode(error_stack::fmt::ColorMode::None);
 
     let config = ServiceConfig {
         controller_name: args.controller_name,
@@ -31,13 +40,17 @@ async fn main() {
     };
 
     let service = service::Service::new(config);
-
     let service = service.start().await;
 
     tokio::signal::ctrl_c().await.unwrap();
     let _ = service.stop().await;
 }
 
-// fn set_logger() {
-//     let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Debug).filter_module("rumqttc", log::LevelFilter::Off).try_init();
-// }
+pub fn get_version() -> String {
+    format!("mqtt_ac: {} (built at {})", built_info::PKG_VERSION, built_info::BUILT_TIME_UTC)
+}
+
+// Include the generated-file as a separate module
+pub mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}

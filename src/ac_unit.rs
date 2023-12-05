@@ -1,6 +1,7 @@
 
 use core::fmt::{Display, Formatter};
 use serde::{Serialize, Deserialize};
+use error_stack::Result;
 
 use crate::error::CoolmasterError;
 
@@ -46,7 +47,7 @@ impl FanSpeed {
             "High" => Ok(FanSpeed::High),
             "Top" => Ok(FanSpeed::Top),
             "Auto" => Ok(FanSpeed::Auto),
-            _ => Err(CoolmasterError::InvalidUnitState("Invalid fan speed", String::from(s))),
+            _ => Err(CoolmasterError::InvalidUnitState("Invalid fan speed", String::from(s)).into()),
         }
     }
 }
@@ -72,7 +73,7 @@ impl OperationMode {
             "Dry" => Ok(OperationMode::Dry),
             "Fan" => Ok(OperationMode::Fan),
             "Auto" => Ok(OperationMode::Auto),
-            _ => Err(CoolmasterError::InvalidUnitState("Invalid operation mode", String::from(s))),
+            _ => Err(CoolmasterError::InvalidUnitState("Invalid operation mode", String::from(s)).into()),
         }
     }
 }
@@ -82,14 +83,14 @@ impl UnitState {
         let fields: Vec<&str> = state_line.split(' ').filter(|s| !s.is_empty()).collect();
 
         if fields.len() != 9 {
-            return Err(CoolmasterError::InvalidUnitState("Wrong number of fields", String::from(state_line)));
+            return Err(CoolmasterError::InvalidUnitState("Wrong number of fields", String::from(state_line)).into());
         }
 
         let unit = fields[0].to_string();
         let power = match fields[1] {
             "ON" => true,
             "OFF" => false,
-            _ => return Err(CoolmasterError::InvalidUnitState("Invalid power state", String::from(state_line))),
+            _ => return Err(CoolmasterError::InvalidUnitState("Invalid power state", String::from(state_line)).into()),
         };
 
         let target_temperature = UnitState::parse_temperature(fields[2])?;
@@ -103,12 +104,12 @@ impl UnitState {
         let filter_change = match fields[7] {
             "-" => false,
             "#" => true,
-            _ => return Err(CoolmasterError::InvalidUnitState("Invalid filter change state", String::from(state_line))),
+            _ => return Err(CoolmasterError::InvalidUnitState("Invalid filter change state", String::from(state_line)).into()),
         };
         let demand = match fields[8] {
             "0" => false,
             "1" => true,
-            _ => return Err(CoolmasterError::InvalidUnitState("Invalid demand state", String::from(state_line))),
+            _ => return Err(CoolmasterError::InvalidUnitState("Invalid demand state", String::from(state_line)).into()),
         };
 
         Ok(UnitState {
@@ -131,7 +132,7 @@ impl UnitState {
         let temperature = match unit {
             'C' => value,
             'F' => (value - 32.0) * 5.0 / 9.0,
-            _ => return Err(CoolmasterError::InvalidTemperature(String::from(temperature))),
+            _ => return Err(CoolmasterError::InvalidTemperature(String::from(temperature)).into()),
         };
         Ok(temperature)
     }
