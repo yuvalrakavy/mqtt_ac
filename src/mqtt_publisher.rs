@@ -1,10 +1,8 @@
+use async_channel::Receiver;
 use error_stack::{Result, ResultExt};
 use std::collections::HashMap;
-use tokio::select;
-use async_channel::Receiver;
-use tokio_util::sync::CancellationToken;
 
-use log::{debug, info};
+use log::debug;
 
 use crate::ac_unit::UnitState;
 use crate::error::MqttError;
@@ -14,87 +12,89 @@ pub struct MqttPublisher {
     controller_name: String,
     unit_states: HashMap<String, UnitState>,
     mqtt_client: rumqttc::AsyncClient,
-    cancellation_token: CancellationToken,
     to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
 }
 
 impl MqttPublisher {
-    pub async fn mqtt_publisher_session(
+    pub async fn session(
         controller_name: String,
         mqtt_client: rumqttc::AsyncClient,
         to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
-        cancellation_token: CancellationToken,
     ) -> Result<(), MqttError> {
-        let mut coolmaster = MqttPublisher::new(
-            controller_name,
-            mqtt_client,
-            to_mqtt_publisher_channel,
-            cancellation_token,
-        );
+        let mut mqtt_publisher =
+            MqttPublisher::new(controller_name, mqtt_client, to_mqtt_publisher_channel);
 
-        coolmaster.do_work().await
+        mqtt_publisher.run_session().await
     }
 
     fn new(
         controller_name: String,
         mqtt_client: rumqttc::AsyncClient,
         to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
-        cancellation_token: CancellationToken,
     ) -> Self {
         MqttPublisher {
             controller_name,
             unit_states: HashMap::new(),
             mqtt_client,
             to_mqtt_publisher_channel,
-            cancellation_token,
         }
     }
 
-    async fn do_work(&mut self) -> Result<(), MqttError> {
+    async fn run_session(&mut self) -> Result<(), MqttError> {
+        let into_context = || MqttError::Context("MQTT Publisher session".to_string());
+
         loop {
-            select! {
-                _ = self.cancellation_token.cancelled() => {
-                    info!("MQTT publisher session cancelled");
-                    break Ok(());
+            let message = self
+                .to_mqtt_publisher_channel
+                .recv()
+                .await
+                .change_context_lazy(into_context)?;
+
+            match message {
+                ToMqttPublisherMessage::UnitState(unit_state) => {
+                    self.publish_if_modified(&unit_state).await?
                 }
 
-                message = self.to_mqtt_publisher_channel.recv() => {
-                    match message {
-                        Ok(message) => match message {
-                            ToMqttPublisherMessage::UnitState(unit_state) => {
-                                self.publish_if_modified(&unit_state).await?
-                            }
-
-                            ToMqttPublisherMessage::UnitsState(unit_states) => {
-                                for unit_state in unit_states {
-                                    self.publish_if_modified(&unit_state).await?;
-                                }
-                            }
-
-                            ToMqttPublisherMessage::Error(error_message) => {
-                                let topic = format!("Aircondition/Error/{}", self.controller_name);
-                                debug!(
-                                    "Publishing to topic {} error_message: {}",
-                                    topic, error_message
-                                );
-                                self.mqtt_client
-                                    .publish(
-                                        topic,
-                                        rumqttc::QoS::AtLeastOnce,
-                                        true,
-                                        serde_json::to_vec(&error_message).unwrap(),
-                                    )
-                                    .await
-                                    .unwrap();
-                            }
-                        },
-
-                        Err(_) => {
-                            info!("MQTT publisher channel closed");
-                            break Ok(());
-                        }
+                ToMqttPublisherMessage::UnitsState(unit_states) => {
+                    for unit_state in unit_states {
+                        self.publish_if_modified(&unit_state).await?;
                     }
+                }
 
+                ToMqttPublisherMessage::Error(error_message) => {
+                    let topic = format!("Aircondition/Error/{}", self.controller_name);
+                    debug!(
+                        "Publishing to topic {} error_message: {}",
+                        topic, error_message
+                    );
+                    self.mqtt_client
+                        .publish(
+                            topic,
+                            rumqttc::QoS::AtLeastOnce,
+                            true,
+                            serde_json::to_vec(&error_message).unwrap(),
+                        )
+                        .await
+                        .change_context_lazy(into_context)?;
+                }
+
+                ToMqttPublisherMessage::CoolmasterConnected(connected) => {
+                    let topic = format!("Aircondition/Coolmaster/{}", self.controller_name);
+
+                    debug!(
+                        "Publishing to topic {} connected: {}",
+                        topic, connected
+                    );
+
+                    self.mqtt_client
+                        .publish(
+                            topic,
+                            rumqttc::QoS::AtLeastOnce,
+                            true,
+                            serde_json::to_vec(&connected).unwrap(),
+                        )
+                        .await
+                        .change_context_lazy(into_context)?;
                 }
             }
         }

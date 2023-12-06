@@ -4,7 +4,6 @@ use log::info;
 use rumqttc::{AsyncClient, EventLoop, LastWill, MqttOptions, QoS};
 use std::marker::PhantomData;
 use tokio::{task::JoinSet, time::Duration};
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     coolmaster::Coolmaster,
@@ -92,8 +91,7 @@ impl Service {
         to_coolmaster_tx: Sender<ToCoolmasterMessage>,
     ) {
         let controller_name = controller_name.into();
-        let publisher_cancel_token = CancellationToken::new();
-        let subscriber_cancel_token = publisher_cancel_token.clone();
+        let mut sessions = JoinSet::new();
 
         let (mqtt_client, event_loop) =
             match Service::connect_to_mqtt_broker(mqtt_broker, &controller_name).await {
@@ -104,43 +102,34 @@ impl Service {
                 }
             };
 
-        let publish_handle = tokio::spawn(async move {
-            match MqttPublisher::mqtt_publisher_session(
+         sessions.spawn(async move {
+            match MqttPublisher::session(
                 controller_name,
                 mqtt_client,
                 to_mqtt_publisher_rx,
-                publisher_cancel_token.clone(),
             )
             .await
             {
                 Ok(_) => info!("MQTT publisher session finished"),
                 Err(e) => info!("MQTT publisher session finished with error: {:?}", e),
             }
-
-            // This should ensure that the subscriber session is also cancelled
-            publisher_cancel_token.cancel();
         });
 
-        let subscriber_handle = tokio::spawn(async move {
-            match mqtt_subscriber::mqtt_subscriber_session(
+        sessions.spawn(async move {
+            match mqtt_subscriber::session(
                 event_loop,
                 to_coolmaster_tx,
                 to_mqtt_publisher_tx,
-                subscriber_cancel_token.clone(),
             )
             .await
             {
                 Ok(_) => info!("MQTT subscriber session finished"),
                 Err(e) => info!("MQTT subscriber session finished with error: {:?}", e),
             }
-
-            // This should ensure that the publisher session is cancelled
-            subscriber_cancel_token.cancel();
         });
 
-        // At this stage, both the publisher and subscriber sessions should have been aborted
-        publish_handle.await.unwrap();
-        subscriber_handle.await.unwrap();
+        _ = sessions.join_next().await;
+        _ = sessions.shutdown().await;
     }
 
     async fn mqtt_worker(

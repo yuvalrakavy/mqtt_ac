@@ -16,5 +16,6 @@ pub enum ToMqttPublisherMessage {
     Error(String),
     UnitState(UnitState),
     UnitsState(Vec<UnitState>),
+    CoolmasterConnected(bool)
 }
 

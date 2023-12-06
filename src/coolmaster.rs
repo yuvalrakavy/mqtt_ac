@@ -1,7 +1,7 @@
+use async_channel::{Receiver, Sender};
 use error_stack::{Result, ResultExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use async_channel::{Sender, Receiver};
 
 use log::{error, info};
 
@@ -25,13 +25,23 @@ impl Coolmaster {
         loop {
             // Work loop
 
+            to_mqtt_publisher_channel
+            .send(ToMqttPublisherMessage::CoolmasterConnected(false))
+            .await
+            .unwrap();
+
             loop {
+
                 // Reconnect loop
                 let connect_result = coolmaster.connect(coolmaster_address).await;
 
                 match connect_result {
                     Ok(_) => {
                         info!("Coolmaster worker connected to coolmaster controller");
+                        to_mqtt_publisher_channel
+                            .send(ToMqttPublisherMessage::CoolmasterConnected(true))
+                            .await
+                            .unwrap();
                         break;
                     }
 
@@ -40,11 +50,13 @@ impl Coolmaster {
                             "Coolmaster worker failed to connect to coolmaster controller: {}",
                             e
                         );
+
                         to_mqtt_publisher_channel
                             .send(ToMqttPublisherMessage::Error(format!("{:#?}", e)))
                             .await
                             .map_err(|_| CoolmasterError::SendToMqttPublisherChannelFailed)
                             .unwrap();
+
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         info!("Coolmaster worker retrying to connect to coolmaster controller");
                     }
@@ -253,13 +265,18 @@ impl Coolmaster {
     // Lower level functions to communicate with coolmaster controller
 
     async fn send_to_coolmaster(&mut self, command: &str) -> Result<(), CoolmasterError> {
-        let into_context = || CoolmasterError::Context(format!("Sending command to coolmaster: '{}'", command));
+        let into_context =
+            || CoolmasterError::Context(format!("Sending command to coolmaster: '{}'", command));
         let stream = self.stream.as_mut().ok_or(CoolmasterError::NotConnected)?;
 
-        TcpStream::write_all(stream, command.as_bytes()).await.change_context_lazy(into_context)?;
+        TcpStream::write_all(stream, command.as_bytes())
+            .await
+            .change_context_lazy(into_context)?;
 
         if !command.ends_with('\r') && !command.ends_with('\n') {
-            TcpStream::write_all(stream, "\r".as_bytes()).await.change_context_lazy(into_context)?;
+            TcpStream::write_all(stream, "\r".as_bytes())
+                .await
+                .change_context_lazy(into_context)?;
         }
 
         Ok(())
@@ -271,7 +288,10 @@ impl Coolmaster {
         let mut reader = BufReader::new(stream);
         let mut bytes = Vec::new();
 
-        reader.read_until(b'>', &mut bytes).await.change_context_lazy(into_context)?;
+        reader
+            .read_until(b'>', &mut bytes)
+            .await
+            .change_context_lazy(into_context)?;
 
         if let Some(last_byte) = bytes.last() {
             if *last_byte == b'>' {
@@ -311,18 +331,17 @@ mod tests {
     const COOLMASTER_ADDRESS: &str = "10.0.1.70";
 
     fn set_logger() {
-        let _ = env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init();
+        _ = tracing_init::TracingInit::builder("mqtt_ac")
+            .log_to_console(true)
+            .init();
     }
 
     #[tokio::test]
     async fn test_coolmaster_worker() {
         set_logger();
 
-        let (to_coolmaster_tx, to_coolmaster_rx) = tokio::sync::mpsc::channel(10);
-        let (to_mqtt_tx, mut to_mqtt_rx) = tokio::sync::mpsc::channel(10);
+        let (to_coolmaster_tx, to_coolmaster_rx) = async_channel::bounded(10);
+        let (to_mqtt_tx, to_mqtt_rx) = async_channel::bounded(10);
 
         let handle = tokio::spawn(async move {
             super::Coolmaster::coolmaster_worker(COOLMASTER_ADDRESS, to_coolmaster_rx, to_mqtt_tx)
@@ -331,12 +350,8 @@ mod tests {
 
         tokio::spawn(async move {
             loop {
-                let mqtt_message = to_mqtt_rx.recv().await;
-
-                match mqtt_message {
-                    None => break,
-                    Some(mqtt_message) => println!("MQTT message: {:?}", mqtt_message),
-                }
+                let mqtt_message = to_mqtt_rx.recv().await.unwrap();
+                println!("MQTT message: {:?}", mqtt_message);
             }
         });
 
