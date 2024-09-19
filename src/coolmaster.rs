@@ -141,6 +141,7 @@ impl Coolmaster {
         reader
             .read_until(b'>', &mut bytes)
             .await
+            .map_err(|e| CoolmasterError::IoError(e))
             .change_context_lazy(into_context)?;
 
         Ok(())
@@ -271,11 +272,13 @@ impl Coolmaster {
 
         TcpStream::write_all(stream, command.as_bytes())
             .await
+            .map_err(|e| CoolmasterError::IoError(e))
             .change_context_lazy(into_context)?;
 
         if !command.ends_with('\r') && !command.ends_with('\n') {
             TcpStream::write_all(stream, "\r".as_bytes())
                 .await
+                .map_err(|e| CoolmasterError::IoError(e))
                 .change_context_lazy(into_context)?;
         }
 
@@ -291,6 +294,7 @@ impl Coolmaster {
         reader
             .read_until(b'>', &mut bytes)
             .await
+            .map_err(|e| CoolmasterError::IoError(e))
             .change_context_lazy(into_context)?;
 
         if let Some(last_byte) = bytes.last() {

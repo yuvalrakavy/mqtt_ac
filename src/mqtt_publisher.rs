@@ -52,13 +52,13 @@ impl MqttPublisher {
 
             match message {
                 ToMqttPublisherMessage::UnitState(unit_state) => {
-                    self.publish_if_modified(&unit_state).await?
+                    self.publish_if_modified(&unit_state).await.change_context_lazy(into_context)?
                 }
 
                 ToMqttPublisherMessage::UnitsState(unit_states) => {
                     for unit_state in unit_states {
-                        self.publish_if_modified(&unit_state).await?;
-                    }
+                        self.publish_if_modified(&unit_state).await.change_context_lazy(into_context)?;
+                    } 
                 }
 
                 ToMqttPublisherMessage::Error(error_message) => {
@@ -75,7 +75,7 @@ impl MqttPublisher {
                             serde_json::to_vec(&error_message).unwrap(),
                         )
                         .await
-                        .change_context_lazy(into_context)?;
+                        .map_err(|e| MqttError::ApiError(e.to_string(), "Publish error".to_owned()))?;
                 }
 
                 ToMqttPublisherMessage::CoolmasterConnected(connected) => {
@@ -83,7 +83,7 @@ impl MqttPublisher {
 
                     debug!(
                         "Publishing to topic {} connected: {}",
-                        topic, connected
+                        &topic, connected
                     );
 
                     self.mqtt_client
@@ -94,7 +94,7 @@ impl MqttPublisher {
                             serde_json::to_vec(&connected).unwrap(),
                         )
                         .await
-                        .change_context_lazy(into_context)?;
+                        .map_err(|e| MqttError::ApiError(e.to_string(),  "Publish coolmaster connected topic {topic}".to_owned()))?;
                 }
             }
         }
@@ -116,7 +116,6 @@ impl MqttPublisher {
             "Aircondition/State/{}/{}",
             self.controller_name, unit_state.unit
         );
-        let into_context = || MqttError::Context(format!("publish_unit_state: topic: {}", topic));
 
         debug!(
             "Publishing to topic {} unit_state: {:#?}",
@@ -130,6 +129,6 @@ impl MqttPublisher {
                 serde_json::to_vec(unit_state).unwrap(),
             )
             .await
-            .change_context_lazy(into_context)
+            .map_err(|e| MqttError::ApiError(e.to_string(), format!("Publish unit {unit} state", unit=&unit_state.unit)).into())
     }
 }

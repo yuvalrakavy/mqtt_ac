@@ -47,7 +47,7 @@ pub async fn session(
         let event = mqtt_event_loop
             .poll()
             .await
-            .change_context_lazy(into_context)?;
+            .map_err(|e| MqttError::ApiError(e.to_string(), "Polling MQTT event loop".to_string()))?;
 
         if let rumqttc::Event::Incoming(Packet::Publish(publish_packet)) = event {
             debug!("Received MQTT message: {:?}", publish_packet);

@@ -25,7 +25,7 @@ async fn main() {
         .log_to_file(true)
         .log_to_server(true)
         .log_file_prefix("ac")
-        .log_file_path("logs")
+        .log_file_path("mqtt_ac")
         .init().map(|t| format!("{t}")).unwrap();
 
     println!("Logging: {}", d);

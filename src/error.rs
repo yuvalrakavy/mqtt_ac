@@ -26,12 +26,18 @@ pub enum CoolmasterError {
     #[error("Send to mqtt publisher channel failed")]
     SendToMqttPublisherChannelFailed,
 
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
+    
     #[error("In context of '{0}'")]
     Context(String),
 }
 
 #[derive(Debug, Error)]
 pub enum MqttError {
+    #[error("Error: {0} In context of '{1}'")]
+    ApiError(String, String),
+
     #[error("In context of '{0}'")]
     Context(String),
 }
