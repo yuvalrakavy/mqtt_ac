@@ -34,7 +34,7 @@ impl Coolmaster {
 
                 // Reconnect loop
                 let connect_result = coolmaster.connect(coolmaster_address).await;
-
+                
                 match connect_result {
                     Ok(_) => {
                         info!("Coolmaster worker connected to coolmaster controller");
@@ -76,29 +76,18 @@ impl Coolmaster {
                             .handle_message(&message, &to_mqtt_publisher_channel)
                             .await
                         {
-                            if let Err(ref e) = coolmaster
-                                .handle_message(&message, &to_mqtt_publisher_channel)
+                            to_mqtt_publisher_channel
+                                .send(ToMqttPublisherMessage::Error(format!(
+                                    "Failed to handle {:#?} - {}",
+                                    message, e
+                                )))
                                 .await
-                            {
-                                error!(
-                                    "Coolmaster worker failed to handle message: {:#?}: {}",
-                                    message,
-                                    e.to_string()
-                                );
+                                .map_err(|_| CoolmasterError::SendToMqttPublisherChannelFailed)
+                                .unwrap();
 
-                                to_mqtt_publisher_channel
-                                    .send(ToMqttPublisherMessage::Error(format!(
-                                        "Failed to handle {:#?} - {}",
-                                        message, e
-                                    )))
-                                    .await
-                                    .map_err(|_| CoolmasterError::SendToMqttPublisherChannelFailed)
-                                    .unwrap();
-                            } else {
-                                error!("Coolmaster worker failed to handle message: {:#?} - error {:#?} - disconnecting from coolmaster", message, e);
-                                coolmaster.stream = None; // Drop the connection, and reconnect
-                                break;
-                            }
+                            error!("Coolmaster worker failed to handle message: {:#?} - error {:#?} - disconnecting from coolmaster", message, e);
+                            coolmaster.stream = None; // Drop the connection, and reconnect
+                            break;
                         }
                     }
                 }
@@ -141,7 +130,7 @@ impl Coolmaster {
         reader
             .read_until(b'>', &mut bytes)
             .await
-            .map_err(|e| CoolmasterError::IoError(e))
+            .map_err(CoolmasterError::IoError)
             .change_context_lazy(into_context)?;
 
         Ok(())
@@ -272,13 +261,13 @@ impl Coolmaster {
 
         TcpStream::write_all(stream, command.as_bytes())
             .await
-            .map_err(|e| CoolmasterError::IoError(e))
+            .map_err(CoolmasterError::IoError)
             .change_context_lazy(into_context)?;
 
         if !command.ends_with('\r') && !command.ends_with('\n') {
             TcpStream::write_all(stream, "\r".as_bytes())
                 .await
-                .map_err(|e| CoolmasterError::IoError(e))
+                .map_err(CoolmasterError::IoError)
                 .change_context_lazy(into_context)?;
         }
 
@@ -294,7 +283,7 @@ impl Coolmaster {
         reader
             .read_until(b'>', &mut bytes)
             .await
-            .map_err(|e| CoolmasterError::IoError(e))
+            .map_err(CoolmasterError::IoError)
             .change_context_lazy(into_context)?;
 
         if let Some(last_byte) = bytes.last() {
