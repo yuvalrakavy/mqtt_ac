@@ -1,0 +1,13 @@
+#[build]
+#target = "i686-pc-windows-gnu"
+
+# .cargo/config.toml
+#[target.i686-pc-windows-gnu]
+#linker = "i686-w64-mingw32-gcc"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "arm-linux-gnueabihf-ld"
+ar = "arm-linux-gnueabihf-ar" # optional
+
+[build]
+target = "armv7-unknown-linux-musleabihf"
