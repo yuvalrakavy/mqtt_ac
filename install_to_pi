@@ -1,0 +1,27 @@
+#!/usr/local/bin/fish
+#
+# Usage: ./install_on_pi.sh <Pi ip address> <MQTT broker> <coolmaster IP address>
+#
+# Coolmaster is 
+#  BZ: 10.0.1.79
+#  TLV: 10.0.10.105
+#
+if test (count $argv) -ne 4
+    echo "Usage: ./install_on_pi.sh <Pi ip address> <MQTT-Broker> <Controller-Name> <Coolmaster-address>"
+    exit 1
+end
+
+set dest $argv[1]
+set mqtt $argv[2]
+set name $argv[3]
+set coolmaster $argv[4]
+set user pi
+set pi_home $user@$dest:~
+
+sed -e "s/_MQTT_/$mqtt/g" -e "s/_NAME_/\"$name\"/g" -e "s/_USER_/$user/g" -e "s/_COOLMASTER_/$coolmaster/g" ac_Template.service > ac.service
+
+scp target/armv7-unknown-linux-musleabihf/release/mqtt_ac $pi_home
+scp ac.service $pi_home
+scp local.network $pi_home
+scp install_on_pi.sh $pi_home
+ssh $user@$dest "source ./install_on_pi.sh"
