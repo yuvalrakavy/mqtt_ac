@@ -85,9 +85,22 @@ impl Coolmaster {
                                 .map_err(|_| CoolmasterError::SendToMqttPublisherChannelFailed)
                                 .unwrap();
 
-                            error!("Coolmaster worker failed to handle message: {:#?} - error {:#?} - disconnecting from coolmaster", message, e);
-                            coolmaster.stream = None; // Drop the connection, and reconnect
-                            break;
+                            if let Some(coolmaster_error) = e.downcast_ref::<CoolmasterError>() {
+                                if let CoolmasterError::CoolmasterCommandError(e)= coolmaster_error {
+                                    error!("Coolmaster replied with an error while handling message: {:#?} - error {:#?}", message, e);
+                                }
+                                else {
+                                    error!("Coolmaster worker failed to handle message: {:#?} - error {:#?} - disconnecting from coolmaster", message, e);
+                                    coolmaster.stream = None; // Drop the connection, and reconnect
+                                    break;
+                                }
+                            }
+                            else {
+                                error!("Coolmaster worker failed handling message {:#?} with unexpected error: {:#?} - disconnecting from coolmaster", message, e);
+                                coolmaster.stream = None; // Drop the connection, and reconnect
+                                break;
+
+                            }
                         }
                     }
                 }
