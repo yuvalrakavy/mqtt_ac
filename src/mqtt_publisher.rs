@@ -64,8 +64,7 @@ impl MqttPublisher {
                 ToMqttPublisherMessage::Error(error_message) => {
                     let topic = format!("Aircondition/Error/{}", self.controller_name);
                     debug!(
-                        "Publishing to topic {} error_message: {}",
-                        topic, error_message
+                        "Publishing to topic {topic} error_message: {error_message}"
                     );
                     self.mqtt_client
                         .publish(
@@ -118,8 +117,7 @@ impl MqttPublisher {
         );
 
         debug!(
-            "Publishing to topic {} unit_state: {:#?}",
-            topic, unit_state
+            "Publishing to topic {topic} unit_state: {unit_state:#?}"
         );
         self.mqtt_client
             .publish(

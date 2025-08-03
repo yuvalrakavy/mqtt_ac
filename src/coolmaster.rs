@@ -47,12 +47,11 @@ impl Coolmaster {
 
                     Err(e) => {
                         info!(
-                            "Coolmaster worker failed to connect to coolmaster controller: {}",
-                            e
+                            "Coolmaster worker failed to connect to coolmaster controller: {e}"
                         );
 
                         to_mqtt_publisher_channel
-                            .send(ToMqttPublisherMessage::Error(format!("{:#?}", e)))
+                            .send(ToMqttPublisherMessage::Error(format!("{e:#?}")))
                             .await
                             .map_err(|_| CoolmasterError::SendToMqttPublisherChannelFailed)
                             .unwrap();
@@ -78,8 +77,7 @@ impl Coolmaster {
                         {
                             to_mqtt_publisher_channel
                                 .send(ToMqttPublisherMessage::Error(format!(
-                                    "Failed to handle {:#?} - {}",
-                                    message, e
+                                    "Failed to handle {message:#?} - {e}"
                                 )))
                                 .await
                                 .map_err(|_| CoolmasterError::SendToMqttPublisherChannelFailed)
@@ -87,16 +85,16 @@ impl Coolmaster {
 
                             if let Some(coolmaster_error) = e.downcast_ref::<CoolmasterError>() {
                                 if let CoolmasterError::CoolmasterCommandError(e)= coolmaster_error {
-                                    error!("Coolmaster replied with an error while handling message: {:#?} - error {:#?}", message, e);
+                                    error!("Coolmaster replied with an error while handling message: {message:#?} - error {e:#?}");
                                 }
                                 else {
-                                    error!("Coolmaster worker failed to handle message: {:#?} - error {:#?} - disconnecting from coolmaster", message, e);
+                                    error!("Coolmaster worker failed to handle message: {message:#?} - error {e:#?} - disconnecting from coolmaster");
                                     coolmaster.stream = None; // Drop the connection, and reconnect
                                     break;
                                 }
                             }
                             else {
-                                error!("Coolmaster worker failed handling message {:#?} with unexpected error: {:#?} - disconnecting from coolmaster", message, e);
+                                error!("Coolmaster worker failed handling message {message:#?} with unexpected error: {e:#?} - disconnecting from coolmaster");
                                 coolmaster.stream = None; // Drop the connection, and reconnect
                                 break;
 
@@ -128,9 +126,9 @@ impl Coolmaster {
 
     async fn connect(&mut self, host: &str) -> Result<(), CoolmasterError> {
         let into_context =
-            || CoolmasterError::Context(format!("Connecting to coolmaster controller at {}", host));
+            || CoolmasterError::Context(format!("Connecting to coolmaster controller at {host}"));
         let (host, port) = Coolmaster::split_host_port(host).change_context_lazy(into_context)?;
-        let stream = TcpStream::connect(format!("{}:{}", host, port))
+        let stream = TcpStream::connect(format!("{host}:{port}"))
             .await
             .change_context_lazy(into_context)?;
         self.stream = Some(stream);
@@ -191,8 +189,8 @@ impl Coolmaster {
 
     async fn set_unit_power(&mut self, unit: &str, power: bool) -> Result<(), CoolmasterError> {
         let _ = match power {
-            true => self.command(&format!("on {}", unit)).await?,
-            false => self.command(&format!("off {}", unit)).await?,
+            true => self.command(&format!("on {unit}")).await?,
+            false => self.command(&format!("off {unit}")).await?,
         };
         Ok(())
     }
@@ -203,11 +201,11 @@ impl Coolmaster {
         mode: ac_unit::OperationMode,
     ) -> Result<(), CoolmasterError> {
         let _ = match mode {
-            ac_unit::OperationMode::Cool => self.command(&format!("cool {}", unit)).await?,
-            ac_unit::OperationMode::Heat => self.command(&format!("heat {}", unit)).await?,
-            ac_unit::OperationMode::Dry => self.command(&format!("dry {}", unit)).await?,
-            ac_unit::OperationMode::Fan => self.command(&format!("fan {}", unit)).await?,
-            ac_unit::OperationMode::Auto => self.command(&format!("auto {}", unit)).await?,
+            ac_unit::OperationMode::Cool => self.command(&format!("cool {unit}")).await?,
+            ac_unit::OperationMode::Heat => self.command(&format!("heat {unit}")).await?,
+            ac_unit::OperationMode::Dry => self.command(&format!("dry {unit}")).await?,
+            ac_unit::OperationMode::Fan => self.command(&format!("fan {unit}")).await?,
+            ac_unit::OperationMode::Auto => self.command(&format!("auto {unit}")).await?,
         };
         Ok(())
     }
@@ -218,7 +216,7 @@ impl Coolmaster {
         temperature: f32,
     ) -> Result<(), CoolmasterError> {
         let _ = self
-            .command(&format!("temp {} {}", unit, temperature))
+            .command(&format!("temp {unit} {temperature}"))
             .await?;
         Ok(())
     }
@@ -237,18 +235,18 @@ impl Coolmaster {
             ac_unit::FanSpeed::Auto => "a",
         };
 
-        self.command(&format!("fspeed {} {}", unit, speed)).await?;
+        self.command(&format!("fspeed {unit} {speed}")).await?;
         Ok(())
     }
 
     async fn reset_filter(&mut self, unit: &str) -> Result<(), CoolmasterError> {
-        let _ = self.command(&format!("filt {}", unit)).await?;
+        let _ = self.command(&format!("filt {unit}")).await?;
         Ok(())
     }
 
     async fn get_unit_state(&mut self, unit: &str) -> Result<UnitState, CoolmasterError> {
-        let into_context = || CoolmasterError::Context(format!("Getting state for unit {}", unit));
-        let reply = self.command(&format!("ls2 {}", unit)).await?;
+        let into_context = || CoolmasterError::Context(format!("Getting state for unit {unit}"));
+        let reply = self.command(&format!("ls2 {unit}")).await?;
 
         UnitState::from_str(&reply).change_context_lazy(into_context)
     }
@@ -269,7 +267,7 @@ impl Coolmaster {
 
     async fn send_to_coolmaster(&mut self, command: &str) -> Result<(), CoolmasterError> {
         let into_context =
-            || CoolmasterError::Context(format!("Sending command to coolmaster: '{}'", command));
+            || CoolmasterError::Context(format!("Sending command to coolmaster: '{command}'"));
         let stream = self.stream.as_mut().ok_or(CoolmasterError::NotConnected)?;
 
         TcpStream::write_all(stream, command.as_bytes())
@@ -357,7 +355,7 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 let mqtt_message = to_mqtt_rx.recv().await.unwrap();
-                println!("MQTT message: {:?}", mqtt_message);
+                println!("MQTT message: {mqtt_message:?}");
             }
         });
 
@@ -389,7 +387,7 @@ mod tests {
         coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
         let reply = coolmaster.command("ls").await.unwrap();
 
-        println!("Reply: {}", reply);
+        println!("Reply: {reply}");
     }
 
     #[tokio::test]
@@ -399,7 +397,7 @@ mod tests {
         coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
         let reply = coolmaster.command("abracadabra").await;
 
-        println!("Reply: {:?}", reply);
+        println!("Reply: {reply:?}");
         assert!(reply.is_err());
     }
 
@@ -423,10 +421,10 @@ mod tests {
         coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
         let state = coolmaster.get_unit_state("L7.400").await.unwrap();
 
-        println!("State: {:?}", state);
+        println!("State: {state:?}");
         let state = coolmaster.get_unit_state("Invalid").await;
         assert!(state.is_err());
-        print!("State: {:?}", state);
+        print!("State: {state:?}");
     }
 
     #[tokio::test]
@@ -436,6 +434,6 @@ mod tests {
         coolmaster.connect(COOLMASTER_ADDRESS).await.unwrap();
         let states = coolmaster.get_units_state().await.unwrap();
 
-        println!("States: {:?}", states);
+        println!("States: {states:?}");
     }
 }

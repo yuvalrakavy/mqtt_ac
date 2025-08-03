@@ -159,14 +159,14 @@ mod tests {
     fn test_parse_unit_state() {
         let state = super::UnitState::from_str("L4.001 OFF 19.0C 23.0C High Heat OK   - 0").unwrap();
         assert_eq!(state.unit, "L4.001");
-        assert_eq!(state.power, false);
+        assert!(!state.power);
         assert_eq!(state.target_temperature, 19.0);
         assert_eq!(state.temperature, 23.0);
         assert_eq!(state.fan_speed, super::FanSpeed::High);
         assert_eq!(state.operation_mode, super::OperationMode::Heat);
         assert_eq!(state.failure_code, None);
-        assert_eq!(state.filter_change, false);
-        assert_eq!(state.demand, false);
+        assert!(!state.filter_change);
+        assert!(!state.demand);
     }
 
 }

@@ -44,8 +44,8 @@ impl Service {
         controller_name: &str,
     ) -> Result<(AsyncClient, EventLoop), MqttError> {
         let into_context =
-            || MqttError::Context(format!("Connecting to MQTT broker '{}'", mqtt_broker));
-        let client_id = format!("Aircondition-{}", controller_name);
+            || MqttError::Context(format!("Connecting to MQTT broker '{mqtt_broker}'"));
+        let client_id = format!("Aircondition-{controller_name}");
         let mut mqtt_options = MqttOptions::new(client_id, mqtt_broker, 1883);
         let last_will_topic = format!("Aircondition/Active/{controller_name}");
         let last_will = LastWill::new(&last_will_topic, "false".as_bytes(), QoS::AtLeastOnce, true);
@@ -97,7 +97,7 @@ impl Service {
             match Service::connect_to_mqtt_broker(mqtt_broker, &controller_name).await {
                 Ok((mqtt_client, event_loop)) => (mqtt_client, event_loop),
                 Err(e) => {
-                    info!("Error connecting to MQTT broker: {:?}", e);
+                    info!("Error connecting to MQTT broker: {e:?}");
                     return;
                 }
             };
@@ -111,7 +111,7 @@ impl Service {
             .await
             {
                 Ok(_) => info!("MQTT publisher session finished"),
-                Err(e) => info!("MQTT publisher session finished with error: {:?}", e),
+                Err(e) => info!("MQTT publisher session finished with error: {e:?}"),
             }
         });
 
@@ -124,7 +124,7 @@ impl Service {
             .await
             {
                 Ok(_) => info!("MQTT subscriber session finished"),
-                Err(e) => info!("MQTT subscriber session finished with error: {:?}", e),
+                Err(e) => info!("MQTT subscriber session finished with error: {e:?}"),
             }
         });
 

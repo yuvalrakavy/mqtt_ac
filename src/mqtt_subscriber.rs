@@ -50,7 +50,7 @@ pub async fn session(
             .map_err(|e| MqttError::ApiError(e.to_string(), "Polling MQTT event loop".to_string()))?;
 
         if let rumqttc::Event::Incoming(Packet::Publish(publish_packet)) = event {
-            debug!("Received MQTT message: {:?}", publish_packet);
+            debug!("Received MQTT message: {publish_packet:?}");
 
             match serde_json::from_slice::<Command>(&publish_packet.payload) {
                 Ok(Command {
@@ -77,11 +77,10 @@ pub async fn session(
                         .change_context_lazy(into_context)?;
                 }
                 Err(e) => {
-                    error!("Error parsing MQTT command message: {:?}", e);
+                    error!("Error parsing MQTT command message: {e:?}");
                     to_mqtt_publish_channel
                         .send(ToMqttPublisherMessage::Error(format!(
-                            "Error parsing MQTT command message: {:?}",
-                            e
+                            "Error parsing MQTT command message: {e:?}"
                         )))
                         .await
                         .change_context_lazy(into_context)?;

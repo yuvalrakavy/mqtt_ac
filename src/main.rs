@@ -28,7 +28,7 @@ async fn main() {
         .log_file_path("logs")
         .init().map(|t| format!("{t}")).unwrap();
 
-    println!("Logging: {}", d);
+    println!("Logging: {d}");
 
     error_stack::Report::set_color_mode(error_stack::fmt::ColorMode::None);
 
