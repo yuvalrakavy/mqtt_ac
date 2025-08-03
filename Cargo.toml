@@ -8,21 +8,21 @@ edition = "2021"
 [dependencies]
 thiserror = "2.0.12"
 error-stack = "0.5.0" 
-tokio = { version="1.44.2", features = ["full", "tracing"]}
-tokio-util = "0.7.15"
+tokio = { version="1.47.1", features = ["full", "tracing"]}
+tokio-util = "0.7.16"
 tokio-stream = "0.1.17"
-async-channel = "2.3.1"
-serde_json = "1.0.140"
+async-channel = "2.5.0"
+serde_json = "1.0.142"
 serde = { version = "1.0.219", features = ["derive"] }
 rumqttc = { version = "0.24.0", default-features = false }
 rustop = "1.1.4"
 tracing = { version = "0.1.41"  }
 log = "0.4.27"
 tracing-init = { git="http://github.com/yuvalrakavy/tracing-init.git" }
-built = "0.7.7" 
+built = "0.8.0" 
 
 [build-dependencies]
-built = { version= "0.7.1", features = ["chrono"] }
+built = { version= "0.8.0", features = ["chrono"] }
 
 # to run with logging use
 #  RUST_LOG=trace,rumqttc=off mqtt_ac ...
