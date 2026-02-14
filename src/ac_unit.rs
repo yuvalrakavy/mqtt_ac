@@ -1,7 +1,7 @@
 
 use core::fmt::{Display, Formatter};
 use serde::{Serialize, Deserialize};
-use error_stack::Result;
+use error_stack::Report;
 
 use crate::error::CoolmasterError;
 
@@ -39,7 +39,7 @@ pub struct UnitState {
 }
 
 impl FanSpeed {
-    pub fn from_str(s: &str) -> Result<FanSpeed, CoolmasterError> {
+    pub fn from_str(s: &str) -> Result<FanSpeed, Report<CoolmasterError>> {
         match s {
             "VLow" => Ok(FanSpeed::VLow),
             "Low" => Ok(FanSpeed::Low),
@@ -66,7 +66,7 @@ impl Display for FanSpeed {
 }
 
 impl OperationMode {
-    pub fn from_str(s: &str) -> Result<OperationMode, CoolmasterError> {
+    pub fn from_str(s: &str) -> Result<OperationMode, Report<CoolmasterError>> {
         match s {
             "Cool" => Ok(OperationMode::Cool),
             "Heat" => Ok(OperationMode::Heat),
@@ -79,7 +79,7 @@ impl OperationMode {
 }
 
 impl UnitState {
-    pub fn from_str(state_line: &str) -> Result<UnitState, CoolmasterError> {
+    pub fn from_str(state_line: &str) -> Result<UnitState, Report<CoolmasterError>> {
         let fields: Vec<&str> = state_line.split(' ').filter(|s| !s.is_empty()).collect();
 
         if fields.len() != 9 {
@@ -125,7 +125,7 @@ impl UnitState {
         })
     }
 
-    fn parse_temperature(temperature: &str) -> Result<f32, CoolmasterError> {
+    fn parse_temperature(temperature: &str) -> Result<f32, Report<CoolmasterError>> {
         let unit = temperature.chars().last().ok_or_else(|| CoolmasterError::InvalidTemperature(String::from(temperature)))?;
         let value = temperature[0..temperature.len() - 1].parse::<f32>().map_err(|_| CoolmasterError::InvalidTemperature(String::from(temperature)))?;
 

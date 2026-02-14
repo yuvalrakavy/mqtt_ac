@@ -2,7 +2,7 @@ use tokio::time::Duration;
 use async_channel::Sender;
 use crate::messages::ToCoolmasterMessage;
 
-use log::debug;
+use log::{debug, error};
 
 pub async fn polling_worker(
     poll_period: Duration,
@@ -11,7 +11,10 @@ pub async fn polling_worker(
     loop {
         debug!("Polling coolmaster");
         let message = ToCoolmasterMessage::PublishUnitsState;
-        to_coolmaster_channel.send(message).await.unwrap();
+        if to_coolmaster_channel.send(message).await.is_err() {
+            error!("Coolmaster channel closed, exiting polling worker");
+            return;
+        }
         tokio::time::sleep(poll_period).await;
     }
 }

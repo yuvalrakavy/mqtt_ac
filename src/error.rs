@@ -23,12 +23,15 @@ pub enum CoolmasterError {
     #[error("Invalid temperature")]
     InvalidTemperature(String),
 
-    #[error("Send to mqtt publisher channel failed")]
-    SendToMqttPublisherChannelFailed,
-
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
-    
+
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
+    #[error("Connection closed by remote")]
+    ConnectionClosed,
+
     #[error("In context of '{0}'")]
     Context(String),
 }

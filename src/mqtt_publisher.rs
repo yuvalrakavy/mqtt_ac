@@ -1,5 +1,5 @@
 use async_channel::Receiver;
-use error_stack::{Result, ResultExt};
+use error_stack::{Report, ResultExt};
 use std::collections::HashMap;
 
 use log::debug;
@@ -20,7 +20,7 @@ impl MqttPublisher {
         controller_name: String,
         mqtt_client: rumqttc::AsyncClient,
         to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
-    ) -> Result<(), MqttError> {
+    ) -> Result<(), Report<MqttError>> {
         let mut mqtt_publisher =
             MqttPublisher::new(controller_name, mqtt_client, to_mqtt_publisher_channel);
 
@@ -40,7 +40,7 @@ impl MqttPublisher {
         }
     }
 
-    async fn run_session(&mut self) -> Result<(), MqttError> {
+    async fn run_session(&mut self) -> Result<(), Report<MqttError>> {
         let into_context = || MqttError::Context("MQTT Publisher session".to_string());
 
         loop {
@@ -99,7 +99,7 @@ impl MqttPublisher {
         }
     }
 
-    async fn publish_if_modified(&mut self, unit_state: &UnitState) -> Result<(), MqttError> {
+    async fn publish_if_modified(&mut self, unit_state: &UnitState) -> Result<(), Report<MqttError>> {
         let unit = &unit_state.unit;
         let old_unit_state = self.unit_states.get(unit);
         if old_unit_state.is_none() || old_unit_state.unwrap() != unit_state {
@@ -110,7 +110,7 @@ impl MqttPublisher {
         Ok(())
     }
 
-    async fn publish_unit_state(&mut self, unit_state: &UnitState) -> Result<(), MqttError> {
+    async fn publish_unit_state(&mut self, unit_state: &UnitState) -> Result<(), Report<MqttError>> {
         let topic = format!(
             "Aircondition/State/{}/{}",
             self.controller_name, unit_state.unit

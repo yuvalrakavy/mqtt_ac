@@ -1,5 +1,4 @@
 use async_channel::{Receiver, Sender};
-use error_stack::{Result, ResultExt};
 use log::info;
 use rumqttc::{AsyncClient, EventLoop, LastWill, MqttOptions, QoS};
 use std::marker::PhantomData;
@@ -7,10 +6,9 @@ use tokio::{task::JoinSet, time::Duration};
 
 use crate::{
     coolmaster::Coolmaster,
-    error::MqttError,
     messages::{ToCoolmasterMessage, ToMqttPublisherMessage},
     mqtt_publisher::MqttPublisher,
-    mqtt_subscriber, polling, get_version,
+    mqtt_subscriber, polling,
 };
 
 pub struct Started {}
@@ -39,12 +37,10 @@ impl Service {
         }
     }
 
-    async fn connect_to_mqtt_broker(
+    fn connect_to_mqtt_broker(
         mqtt_broker: &str,
         controller_name: &str,
-    ) -> Result<(AsyncClient, EventLoop), MqttError> {
-        let into_context =
-            || MqttError::Context(format!("Connecting to MQTT broker '{mqtt_broker}'"));
+    ) -> (AsyncClient, EventLoop) {
         let client_id = format!("Aircondition-{controller_name}");
         let mut mqtt_options = MqttOptions::new(client_id, mqtt_broker, 1883);
         let last_will_topic = format!("Aircondition/Active/{controller_name}");
@@ -53,34 +49,7 @@ impl Service {
             .set_keep_alive(Duration::from_secs(5))
             .set_last_will(last_will);
 
-        let (mqtt_client, event_loop) = AsyncClient::new(mqtt_options, 10);
-
-        // Publish active state
-        mqtt_client
-            .publish(&last_will_topic, QoS::AtLeastOnce, true, "true".as_bytes())
-            .await
-            .change_context_lazy(into_context)?;
-
-            let version = get_version();
-            mqtt_client
-                .publish(
-                    &format!("Aircondition/Version/{controller_name}"),
-                    QoS::AtLeastOnce,
-                    true,
-                    version.as_bytes(),
-                )
-                .await
-                .change_context_lazy(into_context)?;
-    
-        // Subscribe to commands
-        mqtt_client
-            .subscribe(
-                format!("Aircondition/Command/{controller_name}"),
-                QoS::AtLeastOnce,
-            )
-            .await
-            .change_context_lazy(into_context)?;
-        Ok((mqtt_client, event_loop))
+        AsyncClient::new(mqtt_options, 10)
     }
 
     async fn mqtt_session(
@@ -94,15 +63,12 @@ impl Service {
         let mut sessions = JoinSet::new();
 
         let (mqtt_client, event_loop) =
-            match Service::connect_to_mqtt_broker(mqtt_broker, &controller_name).await {
-                Ok((mqtt_client, event_loop)) => (mqtt_client, event_loop),
-                Err(e) => {
-                    info!("Error connecting to MQTT broker: {e:?}");
-                    return;
-                }
-            };
+            Service::connect_to_mqtt_broker(mqtt_broker, &controller_name);
 
-         sessions.spawn(async move {
+        let subscriber_client = mqtt_client.clone();
+        let subscriber_controller_name = controller_name.clone();
+
+        sessions.spawn(async move {
             match MqttPublisher::session(
                 controller_name,
                 mqtt_client,
@@ -118,6 +84,8 @@ impl Service {
         sessions.spawn(async move {
             match mqtt_subscriber::session(
                 event_loop,
+                subscriber_client,
+                subscriber_controller_name,
                 to_coolmaster_tx,
                 to_mqtt_publisher_tx,
             )
