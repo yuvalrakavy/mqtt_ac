@@ -175,9 +175,9 @@ dependencies = [
 
 [[package]]
 name = "error-stack"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe413319145d1063f080f27556fd30b1d70b01e2ba10c2a6e40d4be982ffc5d1"
+checksum = "b878b3fac9613c3c7f22eb70bc8a3c6ebdc03cc11479ee60fde1692d747fd45f"
 dependencies = [
  "anyhow",
  "rustc_version",
@@ -203,6 +203,12 @@ dependencies = [
  "event-listener",
  "pin-project-lite",
 ]
+
+[[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "flume"
@@ -610,16 +616,19 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 
 [[package]]
 name = "rumqttc"
-version = "0.24.0"
+version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1568e15fab2d546f940ed3a21f48bbbd1c494c90c99c4481339364a497f94a9"
+checksum = "0feff8d882bff0b2fddaf99355a10336d43dd3ed44204f85ece28cf9626ab519"
 dependencies = [
  "bytes",
+ "fixedbitset",
  "flume",
  "futures-util",
  "log",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]
