@@ -1,0 +1,31 @@
+# Logging & tracing configuration for the mqtt_ac bridge.
+#
+# Auto-discovered by tracing-init: searched upward from the process working
+# directory. The systemd unit runs with WorkingDirectory=/home/<user>, so on
+# the Pi this file is deployed next to the binary (install_to_pi copies it).
+#
+# Fleet policy: ~/Documents/Projects/Store/docs/guides/logging-policy.md
+# (ERROR = code fix warranted; WARN = zero-at-idle, every WARN carries kind).
+
+[logging]
+# "+g+o" ADDS GELF and OpenTelemetry to the destinations the binary already
+# configures (file + optional console). Use plain letters (e.g. "fgo") to
+# replace them instead.
+destination = "+g+o"
+# Telemetry must never prevent the bridge from starting: a destination that
+# fails to initialize (e.g. unresolvable GELF host) is skipped with a stderr
+# note + a SKIPPED entry in the startup summary, instead of failing init.
+on_destination_error = "skip"
+
+[logging.gelf]
+# logmon-broker GELF ingest (UDP). Adjust per site; with
+# on_destination_error = "skip" a wrong/unresolvable host costs only the
+# GELF destination, not the bridge.
+address = "yuvals-mac-studio.villarakavy.local:12201"
+
+[logging.otel]
+# logmon-broker OTLP ingest — exports spans. Required for distributed traces:
+# the MQTT v5 traceparent propagation only lights up when the "o" destination
+# installs the OpenTelemetry layer.
+endpoint = "http://yuvals-mac-studio.villarakavy.local:4318"
+transport = "http"

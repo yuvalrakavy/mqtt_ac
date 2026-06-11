@@ -23,9 +23,9 @@ async fn main() {
 
     let d = tracing_init::TracingInit::builder("mqtt_ac")
         .log_to_file(true)
-        .log_to_server(true)
-        .log_file_prefix("ac")
-        .log_file_path("logs")
+        .log_to_gelf_server(true)
+        .file_prefix("ac")
+        .file_path("logs")
         .init().map(|t| format!("{t}")).unwrap();
 
     println!("Logging: {d}");

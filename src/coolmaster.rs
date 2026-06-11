@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use log::{error, info};
+use tracing::{info, warn};
 
 use crate::ac_unit::{self, UnitState};
 use crate::error::CoolmasterError;
@@ -46,7 +46,7 @@ impl Coolmaster {
                 .await
                 .is_err()
             {
-                error!("MQTT publisher channel closed, exiting coolmaster worker");
+                info!("MQTT publisher channel closed, exiting coolmaster worker");
                 return;
             }
 
@@ -60,7 +60,7 @@ impl Coolmaster {
                             .await
                             .is_err()
                         {
-                            error!("MQTT publisher channel closed, exiting coolmaster worker");
+                            info!("MQTT publisher channel closed, exiting coolmaster worker");
                             return;
                         }
                         break;
@@ -80,7 +80,7 @@ impl Coolmaster {
                 let message = match to_coolmaster_channel.recv().await {
                     Ok(msg) => msg,
                     Err(_) => {
-                        error!("Coolmaster command channel closed, exiting worker");
+                        info!("Coolmaster command channel closed, exiting worker");
                         return;
                     }
                 };
@@ -98,9 +98,19 @@ impl Coolmaster {
                     if let Some(CoolmasterError::CoolmasterCommandError(cmd_err)) =
                         e.downcast_ref::<CoolmasterError>()
                     {
-                        error!("Coolmaster command error for {message:#?}: {cmd_err}");
+                        // Command rejected by coolmaster (e.g. invalid unit id): external device error.
+                        warn!(
+                            kind = "external_failure",
+                            error = %cmd_err,
+                            "Coolmaster command rejected"
+                        );
                     } else {
-                        error!("Coolmaster connection error for {message:#?}: {e:#?} - reconnecting");
+                        // TCP-level failure: designed degradation, reconnect will fire.
+                        info!(
+                            kind = "connection_lost",
+                            error = %e,
+                            "Coolmaster connection lost, reconnecting"
+                        );
                         coolmaster.stream = None;
                         break;
                     }

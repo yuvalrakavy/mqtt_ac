@@ -1,8 +1,8 @@
 use async_channel::{Receiver, Sender};
-use log::info;
-use rumqttc::{AsyncClient, EventLoop, LastWill, MqttOptions, QoS};
+use rumqttc::v5::{AsyncClient, EventLoop, MqttOptions, mqttbytes::QoS, mqttbytes::v5::LastWill};
 use std::marker::PhantomData;
 use tokio::{task::JoinSet, time::Duration};
+use tracing::info;
 
 use crate::{
     coolmaster::Coolmaster,
@@ -44,12 +44,12 @@ impl Service {
         let client_id = format!("Aircondition-{controller_name}");
         let mut mqtt_options = MqttOptions::new(client_id, mqtt_broker, 1883);
         let last_will_topic = format!("Aircondition/Active/{controller_name}");
-        let last_will = LastWill::new(&last_will_topic, "false".as_bytes(), QoS::AtLeastOnce, true);
+        let last_will = LastWill::new(&last_will_topic, "false".as_bytes(), QoS::AtLeastOnce, true, None);
         mqtt_options
             .set_keep_alive(Duration::from_secs(5))
             .set_last_will(last_will);
 
-        AsyncClient::new(mqtt_options, 10)
+        AsyncClient::new(mqtt_options, 100)
     }
 
     async fn mqtt_session(

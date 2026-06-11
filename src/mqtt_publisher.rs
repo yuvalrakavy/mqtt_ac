@@ -2,23 +2,24 @@ use async_channel::Receiver;
 use error_stack::{Report, ResultExt};
 use std::collections::HashMap;
 
-use log::debug;
+use tracing::debug;
 
 use crate::ac_unit::UnitState;
 use crate::error::MqttError;
 use crate::messages::ToMqttPublisherMessage;
+use rumqttc::v5::{self, mqttbytes::QoS, mqttbytes::v5::PublishProperties};
 
 pub struct MqttPublisher {
     controller_name: String,
     unit_states: HashMap<String, UnitState>,
-    mqtt_client: rumqttc::AsyncClient,
+    mqtt_client: v5::AsyncClient,
     to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
 }
 
 impl MqttPublisher {
     pub async fn session(
         controller_name: String,
-        mqtt_client: rumqttc::AsyncClient,
+        mqtt_client: v5::AsyncClient,
         to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
     ) -> Result<(), Report<MqttError>> {
         let mut mqtt_publisher =
@@ -29,7 +30,7 @@ impl MqttPublisher {
 
     fn new(
         controller_name: String,
-        mqtt_client: rumqttc::AsyncClient,
+        mqtt_client: v5::AsyncClient,
         to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
     ) -> Self {
         MqttPublisher {
@@ -58,20 +59,26 @@ impl MqttPublisher {
                 ToMqttPublisherMessage::UnitsState(unit_states) => {
                     for unit_state in unit_states {
                         self.publish_if_modified(&unit_state).await.change_context_lazy(into_context)?;
-                    } 
+                    }
                 }
 
                 ToMqttPublisherMessage::Error(error_message) => {
                     let topic = format!("Aircondition/Error/{}", self.controller_name);
                     debug!(
-                        "Publishing to topic {topic} error_message: {error_message}"
+                        topic = %topic,
+                        "Publishing error message"
                     );
+                    let mut props = PublishProperties::default();
+                    if let Some(tp) = tracing_init::traceparent::current() {
+                        props.user_properties.push(("traceparent".into(), tp));
+                    }
                     self.mqtt_client
-                        .publish(
+                        .publish_with_properties(
                             topic,
-                            rumqttc::QoS::AtLeastOnce,
+                            QoS::AtLeastOnce,
                             true,
                             serde_json::to_vec(&error_message).unwrap(),
+                            props,
                         )
                         .await
                         .map_err(|e| MqttError::ApiError(e.to_string(), "Publish error".to_owned()))?;
@@ -81,19 +88,25 @@ impl MqttPublisher {
                     let topic = format!("Aircondition/Coolmaster/{}", self.controller_name);
 
                     debug!(
-                        "Publishing to topic {} connected: {}",
-                        &topic, connected
+                        topic = %topic,
+                        connected,
+                        "Publishing coolmaster connection status"
                     );
 
+                    let mut props = PublishProperties::default();
+                    if let Some(tp) = tracing_init::traceparent::current() {
+                        props.user_properties.push(("traceparent".into(), tp));
+                    }
                     self.mqtt_client
-                        .publish(
+                        .publish_with_properties(
                             topic,
-                            rumqttc::QoS::AtLeastOnce,
+                            QoS::AtLeastOnce,
                             true,
                             serde_json::to_vec(&connected).unwrap(),
+                            props,
                         )
                         .await
-                        .map_err(|e| MqttError::ApiError(e.to_string(),  "Publish coolmaster connected topic {topic}".to_owned()))?;
+                        .map_err(|e| MqttError::ApiError(e.to_string(), "Publish coolmaster connected".to_owned()))?;
                 }
             }
         }
@@ -117,16 +130,25 @@ impl MqttPublisher {
         );
 
         debug!(
-            "Publishing to topic {topic} unit_state: {unit_state:#?}"
+            topic = %topic,
+            unit = %unit_state.unit,
+            "Publishing unit state"
         );
+
+        let mut props = PublishProperties::default();
+        if let Some(tp) = tracing_init::traceparent::current() {
+            props.user_properties.push(("traceparent".into(), tp));
+        }
+
         self.mqtt_client
-            .publish(
+            .publish_with_properties(
                 &topic,
-                rumqttc::QoS::AtLeastOnce,
+                QoS::AtLeastOnce,
                 true,
                 serde_json::to_vec(unit_state).unwrap(),
+                props,
             )
             .await
-            .map_err(|e| MqttError::ApiError(e.to_string(), format!("Publish unit {unit} state", unit=&unit_state.unit)).into())
+            .map_err(|e| MqttError::ApiError(e.to_string(), format!("Publish unit {} state", unit_state.unit)).into())
     }
 }

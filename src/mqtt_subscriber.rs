@@ -3,14 +3,14 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use std::time::Duration;
 
-use log::{debug, error, info};
+use tracing::{debug, info, warn, Instrument};
 
 use crate::{
     ac_unit::{FanSpeed, OperationMode},
     error::MqttError,
     messages::{ToCoolmasterMessage, ToMqttPublisherMessage},
 };
-use rumqttc::{self, Packet, QoS};
+use rumqttc::v5::{self, mqttbytes::QoS, mqttbytes::v5::Packet};
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
@@ -38,8 +38,8 @@ struct Command {
 }
 
 pub async fn session(
-    mut mqtt_event_loop: rumqttc::EventLoop,
-    mqtt_client: rumqttc::AsyncClient,
+    mut mqtt_event_loop: v5::EventLoop,
+    mqtt_client: v5::AsyncClient,
     controller_name: String,
     to_coolmaster_channel: Sender<ToCoolmasterMessage>,
     to_mqtt_publish_channel: Sender<ToMqttPublisherMessage>,
@@ -55,16 +55,27 @@ pub async fn session(
         debug!("Waiting for MQTT message");
 
         let event = match mqtt_event_loop.poll().await {
-            Ok(event) => {
-                consecutive_errors = 0;
-                event
-            }
+            Ok(event) => event,
             Err(e) => {
                 consecutive_errors += 1;
-                error!(
-                    "MQTT poll error ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}"
-                );
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                // Per-iteration poll error is INFO (transient, recovers); the threshold
+                // cross is the WARN that signals a persistent outage.
+                if consecutive_errors < MAX_CONSECUTIVE_ERRORS {
+                    info!(
+                        kind = "external_failure",
+                        error = %e,
+                        consecutive_errors,
+                        max = MAX_CONSECUTIVE_ERRORS,
+                        "MQTT poll error"
+                    );
+                } else {
+                    warn!(
+                        kind = "external_failure",
+                        error = %e,
+                        consecutive_errors,
+                        max = MAX_CONSECUTIVE_ERRORS,
+                        "MQTT poll error threshold reached, giving up"
+                    );
                     return Err(MqttError::ApiError(
                         e.to_string(),
                         "Too many consecutive MQTT poll errors".to_string(),
@@ -76,34 +87,82 @@ pub async fn session(
             }
         };
 
+        // Only reset consecutive_errors on Incoming events (proof of broker
+        // connectivity). Outgoing events (e.g. ConnectRequest) are emitted by
+        // rumqttc during reconnection attempts and must NOT reset the counter.
+        if matches!(event, v5::Event::Incoming(_)) {
+            consecutive_errors = 0;
+        }
+
         match event {
-            rumqttc::Event::Incoming(Packet::ConnAck(_)) => {
-                info!("Connected to MQTT broker, setting up session");
+            v5::Event::Incoming(Packet::ConnAck(_)) => {
+                info!(kind = "external_recovered", "Connected to MQTT broker, setting up session");
+
+                // Use non-blocking try_publish/try_subscribe to avoid deadlock:
+                // the subscriber is the only task calling poll() which drains the
+                // internal rumqttc channel. If we block here on a full channel,
+                // poll() never runs and the channel never drains.
+
+                // Stamp outbound publishes with traceparent if a trace is active.
+                let mut props = rumqttc::v5::mqttbytes::v5::PublishProperties::default();
+                if let Some(tp) = tracing_init::traceparent::current() {
+                    props.user_properties.push(("traceparent".into(), tp));
+                }
 
                 mqtt_client
-                    .publish(&active_topic, QoS::AtLeastOnce, true, "true".as_bytes())
-                    .await
+                    .try_publish_with_properties(
+                        &active_topic,
+                        QoS::AtLeastOnce,
+                        true,
+                        "true".as_bytes(),
+                        props.clone(),
+                    )
                     .map_err(|e| MqttError::ApiError(e.to_string(), "Publish Active".to_string()))
                     .change_context_lazy(into_context)?;
 
                 mqtt_client
-                    .publish(&version_topic, QoS::AtLeastOnce, true, version.as_bytes())
-                    .await
+                    .try_publish_with_properties(
+                        &version_topic,
+                        QoS::AtLeastOnce,
+                        true,
+                        version.as_bytes().to_vec(),
+                        props,
+                    )
                     .map_err(|e| MqttError::ApiError(e.to_string(), "Publish Version".to_string()))
                     .change_context_lazy(into_context)?;
 
                 mqtt_client
-                    .subscribe(&command_topic, QoS::AtLeastOnce)
-                    .await
+                    .try_subscribe(&command_topic, QoS::AtLeastOnce)
                     .map_err(|e| {
                         MqttError::ApiError(e.to_string(), "Subscribe to commands".to_string())
                     })
                     .change_context_lazy(into_context)?;
             }
 
-            rumqttc::Event::Incoming(Packet::Publish(publish_packet)) => {
-                debug!("Received MQTT message: {publish_packet:?}");
+            v5::Event::Incoming(Packet::Publish(publish_packet)) => {
+                let topic = String::from_utf8_lossy(&publish_packet.topic).into_owned();
+                debug!(topic = %topic, "Received MQTT message");
 
+                // Extract inbound traceparent and attach to the handling span.
+                let traceparent = publish_packet
+                    .properties
+                    .as_ref()
+                    .and_then(|p| {
+                        p.user_properties
+                            .iter()
+                            .find(|(k, _)| k == "traceparent")
+                            .map(|(_, v)| v.clone())
+                    });
+
+                let span = tracing::info_span!("mqtt_command", topic = %topic);
+                if let Some(tp) = &traceparent {
+                    tracing_init::traceparent::set_remote_parent(&span, tp);
+                }
+
+                // Span entry via .instrument(): never hold span.enter()
+                // across .await — on the multi-thread runtime it corrupts
+                // the current-span thread-local (fleet logging policy).
+                let handled: Result<(), Report<MqttError>> = async {
                 match serde_json::from_slice::<Command>(&publish_packet.payload) {
                     Ok(Command {
                         unit,
@@ -129,7 +188,13 @@ pub async fn session(
                             .change_context_lazy(into_context)?;
                     }
                     Err(e) => {
-                        error!("Error parsing MQTT command message: {e:?}");
+                        // Malformed payload is a designed degradation (user error), not a code bug.
+                        info!(
+                            kind = "validation_rejected",
+                            topic = %topic,
+                            error = %e,
+                            "MQTT command payload rejected: JSON parse failed"
+                        );
                         to_mqtt_publish_channel
                             .send(ToMqttPublisherMessage::Error(format!(
                                 "Error parsing MQTT command message: {e:?}"
@@ -138,6 +203,11 @@ pub async fn session(
                             .change_context_lazy(into_context)?;
                     }
                 }
+                Ok(())
+                }
+                .instrument(span)
+                .await;
+                handled?;
             }
 
             _ => {}

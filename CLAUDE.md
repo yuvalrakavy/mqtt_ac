@@ -66,3 +66,20 @@ MQTT Subscriber ──→ ToCoolmasterMessage channel ──↗        │
 - **Type-state pattern**: `Service<Stopped>` / `Service<Started>` using phantom types
 - **Message passing**: All inter-worker communication goes through async channels, no shared mutable state
 - **Coolmaster protocol**: TCP text protocol — send command + `\r`, read until `>` prompt, parse `OK` / `ERROR` status line
+
+## Logging
+
+Log levels follow the fleet policy at `~/Documents/Projects/Store/docs/guides/logging-policy.md` (portable core also in the user-level `logging-policy` skill):
+
+- **ERROR** — a code change is warranted; never for external/environmental failures
+- **WARN** — operator must act; must be zero at idle; always include a `kind` field
+- **INFO** — notable lifecycle events (connect/disconnect, orderly shutdown)
+- **DEBUG** — per-iteration detail (polling ticks, message receipt)
+
+External outages (MQTT broker unreachable, Coolmaster TCP errors) are `kind = "external_failure"` at INFO per iteration and promoted to WARN only when a threshold is crossed. Orderly shutdown of channels is INFO (not WARN/ERROR).
+
+This bridge joins distributed traces via MQTT v5 `traceparent` user properties:
+- **Inbound**: `traceparent` user property extracted from each Publish packet; span created with `tracing_init::traceparent::set_remote_parent` before entering
+- **Outbound**: `tracing_init::traceparent::current()` stamped as a `traceparent` user property on every publish
+
+GELF and OTel destinations are deploy-time config (`LOG_DESTINATION` env var / config file). The `otel` feature in `tracing-init` must be enabled (already in `Cargo.toml`).

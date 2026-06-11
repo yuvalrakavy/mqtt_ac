@@ -18,11 +18,14 @@ rumqttc = { version = "0.25.1", default-features = false }
 rustop = "1.1.4"
 tracing = { version = "0.1.41"  }
 log = "0.4.27"
-tracing-init = { git="http://github.com/yuvalrakavy/tracing-init.git" }
-built = "0.8.0" 
+tracing-init = { git="http://github.com/yuvalrakavy/tracing-init.git", features = ["otel"] }
+built = "0.8.0"
 
 [build-dependencies]
 built = { version= "0.8.0", features = ["chrono"] }
+
+# The otel feature was added at git rev 69ff434 (version 0.2.0).
+# Run `cargo update -p tracing-init` after first clone to refresh the lock file.
 
 # to run with logging use
 #  RUST_LOG=trace,rumqttc=off mqtt_ac ...
