@@ -65,7 +65,8 @@ the four `Set*` are **states**, kept per unit and property (a newer value replac
 and moves it to the back), applied in that order on reconnect; `ResetFilter` is **momentary**,
 refused at once with an error on `Aircondition/Error/{controller}` while the Coolmaster is down
 (queued, up to 64, while it is up); `PublishUnitState`/`PublishUnitsState` are **reads**,
-coalesced, dropped while it is down. An outage is logged as one episode: INFO
+coalesced, dropped while it is down. The Coolmaster counts as down until the worker's first
+connect, so the same holds before it. An outage is logged as one episode: INFO
 `device_connection_lost`, one WARN `device_unreachable` past 30 s, INFO `device_recovered`
 (`down_for_ms`, `applied`, `refused`); the first refusal of an outage is an INFO `command_refused`.
 
@@ -122,6 +123,8 @@ Log levels follow the fleet policy at `~/Documents/Projects/Store/docs/guides/lo
 - **DEBUG** — per-iteration detail (polling ticks, message receipt)
 
 External outages (MQTT broker unreachable, Coolmaster unreachable) are each one episode: an INFO when it starts, retries at DEBUG, one WARN once it has lasted 30 s, an INFO with its length when it ends (kinds above). Orderly shutdown of channels is INFO (not WARN/ERROR).
+
+The bridge writes nothing to stdout or stderr itself: a supervisor's pipe that stopped draining would hold the writer outside every bound. Lifecycle messages (the logging summary, `Logging started`) go through tracing-init's lossy sinks; the logging's own failure is written by the thread of the raced logging start, which a stop ends regardless; anything earlier goes nowhere but the exit status. The one exemption is `rustop`'s own command-line output (`--help`, a usage error), before anything starts.
 
 Kinds this bridge emits: broker — `connection_lost` (INFO), `external_failure` (WARN, the broker outage only), `external_recovered` (INFO); Coolmaster — `device_connection_lost` (INFO), `device_unreachable` (WARN), `device_recovered` (INFO), `command_refused` (INFO, a momentary command while the Coolmaster is down), `command_rejected` (WARN, a command the Coolmaster refused: fix the unit id or the config); MQTT queue — `mqtt_backlog_high` (WARN), `mqtt_backlog_drained` (INFO), `mqtt_commands_discarded` (WARN); the worker's error reports — `error_report_dropped` (WARN, older ones displaced while MQTT takes none) and `error_report_drop_ended` (INFO, `dropped`, `lasted_ms`); `validation_rejected` (INFO, a malformed command payload); `worker_died` (ERROR, a worker ended: the bridge ends); `shutdown_timeout` (WARN); `signal_handler_unavailable` (WARN).
 

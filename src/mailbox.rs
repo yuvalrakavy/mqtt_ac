@@ -185,12 +185,14 @@ fn log_refusal(command: &ToCoolmasterMessage, why: Refusal, first: bool) {
 }
 
 impl Mailbox {
-    /// A mailbox that takes posts as though the Coolmaster were connected until the worker first
-    /// finds it is not, so nothing is refused before the worker has tried.
+    /// A mailbox for a Coolmaster not connected yet: until the worker's first connect, states are
+    /// held for it, momentary commands refused and reads dropped, as in any outage (re-review C10:
+    /// started as connected, a momentary command posted before the first connect was queued, and
+    /// applied whenever that connect came).
     pub fn new() -> Arc<Mailbox> {
         Arc::new(Mailbox {
             state: Mutex::new(State {
-                connected: true,
+                connected: false,
                 pending: VecDeque::new(),
                 momentary: 0,
                 refused: 0,

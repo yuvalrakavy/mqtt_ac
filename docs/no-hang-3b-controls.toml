@@ -17,7 +17,11 @@
 # logged as 4 outages with no WARN; a multibyte temperature panicked the parser; a worker's panic
 # left the bridge running (against a stub of the old `serve`); SIGTERM during a stalled logging
 # start killed the process (signal 15). C8's test passed there: it closes a test gap, and its
-# control is what shows it.)
+# control is what shows it. Round 4's (review 3: B2, B3, C10), on 4e9ab21: with a stdout and stderr
+# nobody drains the bridge never subscribed (its own logging summary blocked the start), and
+# SIGTERM could not end it; a ResetFilter posted before the first connect was queued and applied
+# (["ls2", "filt L1.001", "on L1.001"]); with SIGTERM sent 3 s in, the stalled-start test let a
+# dropped runtime pass, its deadline counted from the signal.)
 #
 # The stand-in Coolmaster serves at most a few connections in the reconnect-loop tests, so a
 # mutant that spins is caught after a dozen connections, not thousands: uncapped, one spun 16,282
@@ -544,3 +548,27 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "stalled"]
 expect_text = "did not stop cleanly within its bound on SIGTERM while its logging start was stalled: signal: 15"
 guard       = "signals_before_logging"
+
+# Round 4 (B2): the bridge prints its logging summary to stdout itself, as it did: with a stdout
+# nobody drains, the start waits there, and SIGTERM cannot end it.
+[[control]]
+name        = "the_logging_summary_is_printed"
+file        = "src/main.rs"
+anchor      = '''        info!(logging = %guard, "Logging started");'''
+replacement = '''        println!("Logging: {guard}");'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "nobody_reads"]
+expect_text = "the bridge never subscribed: its start waited on a stdout or stderr nobody reads"
+guard       = "no_blocking_lifecycle_prints"
+
+# Round 4 (C10): the mailbox starts connected, as it did: a momentary command posted before the
+# first connect is queued and applied.
+[[control]]
+name        = "a_new_mailbox_starts_connected"
+file        = "src/mailbox.rs"
+anchor      = '''                connected: false,'''
+replacement = '''                connected: true,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "before_the_first_connect"]
+expect_text = "before the first connect, a momentary command should be refused"
+guard       = "mailbox_down_until_first_connect"

@@ -6,6 +6,9 @@
 //! bound and return from `main`, so tracing-init's guard is dropped and flushes the log. Killed by
 //! the signal instead, it skips both, and the log loses whatever it had not written yet.
 
+use std::io::{ErrorKind, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -38,6 +41,74 @@ fn logged(dir: &Path) -> String {
         }
     }
     text
+}
+
+/// A stream whose buffer is already full, as a supervisor's stdout that stopped draining: a write
+/// to it waits until someone reads, and nobody does. Returns the full end, for the bridge, and the
+/// other, to hold unread until the bridge has exited.
+fn full_stream() -> (UnixStream, UnixStream) {
+    let (full, unread) = UnixStream::pair().expect("a socket pair");
+    full.set_nonblocking(true).expect("a non-blocking socket");
+    // Large writes until it takes no more, then single bytes: a large write can be refused while
+    // some room is left (the low-water mark), a single byte only when none is.
+    for chunk in [&[b'x'; 4096][..], &b"x"[..]] {
+        loop {
+            match (&full).write(chunk) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("filling the socket: {e}"),
+            }
+        }
+    }
+    full.set_nonblocking(false).expect("a blocking socket again");
+    (full, unread)
+}
+
+/// The bridge's stdout and stderr are a pipe its supervisor no longer drains (re-review B2): a
+/// line the bridge writes there itself waits until someone reads, outside every bound, so its
+/// lifecycle messages go through tracing-init's lossy sinks instead. The bridge must start —
+/// subscribe — and stop on SIGTERM, cleanly, with both full and unread throughout. Printing its
+/// logging summary to stdout itself, it never gets past its start, and SIGTERM cannot end it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stdout_and_stderr_nobody_reads_hold_neither_the_start_nor_the_stop() {
+    let broker = FakeBroker::start().await;
+    let dir = workdir("full_stdout");
+    let (full, unread) = full_stream();
+    let stdout = OwnedFd::from(full.try_clone().expect("a second handle on the full socket"));
+    let mut bridge = tokio::process::Command::new(env!("CARGO_BIN_EXE_mqtt_ac"))
+        .args([NAME, broker.address().as_str(), refused_address().as_str()])
+        .current_dir(&dir)
+        .env("LOG_CONFIG", dir.join("logging.toml"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(OwnedFd::from(full)))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the bridge");
+
+    let started = broker
+        .wait_for_subscription(&format!("Aircondition/Command/{NAME}"), Duration::from_secs(10))
+        .await;
+    let pid = bridge.id().expect("the bridge's pid").to_string();
+    let sent = std::process::Command::new("kill").args(["-TERM", &pid]).status();
+    assert!(sent.is_ok_and(|s| s.success()), "could not send SIGTERM to the bridge");
+    let exited = match tokio::time::timeout(Duration::from_secs(15), bridge.wait()).await {
+        Ok(status) => Some(status.expect("the bridge's exit status")),
+        Err(_) => {
+            let _ = bridge.start_kill();
+            None
+        }
+    };
+    // Unread until the bridge has exited.
+    drop(unread);
+    assert!(
+        started,
+        "the bridge never subscribed: its start waited on a stdout or stderr nobody reads"
+    );
+    assert!(
+        exited.is_some_and(|status| status.success()),
+        "the bridge did not stop cleanly on SIGTERM with a stdout and stderr nobody reads: {exited:?}"
+    );
 }
 
 /// A loopback address nothing listens on: the bridge's Coolmaster, unreachable.
@@ -113,18 +184,25 @@ async fn sigint_stops_the_bridge_cleanly() {
 /// The whole process stops within its bound, whatever a blocking thread is doing (re-review C6,
 /// the fleet's F1 and F3). The bridge's file-system work is tracing-init's: it reads its logging
 /// configuration and opens today's log file. Here that log file is a FIFO nobody reads, so
-/// opening it for writing never returns — as on a stalled file system. tracing-init gives that
-/// open 5 s and then starts without the file (`log_destination_skipped`, since 97eebba), so the
-/// logging start ends by itself about 5 s in; SIGTERM, sent 1 s in, must stop the bridge cleanly
-/// well before that:
+/// opening it for writing never returns — as on a stalled file system. (A FIFO as the
+/// configuration does not stall it: tracing-init 97eebba takes a configuration only from a regular
+/// file, and falls back to `logging.toml` past anything else.) tracing-init gives the open 5 s and
+/// then starts without the file (`log_destination_skipped`), so the start ends by itself 5 s after
+/// it began, and so no sooner than 5 s after the spawn. SIGTERM, sent 1 s in, must stop the bridge
+/// cleanly before that:
 /// - the stop signals are taken before the logging starts — taken after it, SIGTERM kills the
 ///   stalled bridge (signal 15);
-/// - the start is raced against the stop — not raced, the bridge waits out the start, about 4 s;
+/// - the start is raced against the stop — not raced, the bridge waits out the start;
 /// - the runtime is shut down within its 1 s grace, abandoning the blocking thread still in the
-///   start — dropped, it waits for that thread, about 4 s (and, in production, for a DNS lookup of
-///   the broker's or the Coolmaster's name as long as the resolver takes).
+///   start — dropped, it waits for that thread (and, in production, for a DNS lookup of the broker's
+///   or the Coolmaster's name as long as the resolver takes).
 ///
-/// So the bridge must exit, cleanly, within 2.5 s of SIGTERM.
+/// The deadline is counted from the spawn, not from the signal: the bridge must be gone within
+/// 4.5 s of it, which waiting out the start can never meet, however late the signal goes out — a
+/// delay can fail the test, never pass a regression (re-review B3: counted from the signal, a
+/// signal late by 2 s let a dropped runtime pass). And the test proves the start was still held
+/// when the signal came: the bridge had not reached its service (no connection to the broker), and
+/// its exit used up the runtime's grace (a thread was still in the start).
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_during_a_stalled_logging_start_stops_the_bridge_within_its_bound() {
     let broker = FakeBroker::start().await;
@@ -139,6 +217,7 @@ async fn sigterm_during_a_stalled_logging_start_stops_the_bridge_within_its_boun
     let fifo = dir.join("logs").join(format!("ac.{today}.log"));
     let made = std::process::Command::new("mkfifo").arg(&fifo).status();
     assert!(made.is_ok_and(|s| s.success()), "could not make the FIFO");
+    let spawned = std::time::Instant::now();
     let mut bridge = tokio::process::Command::new(env!("CARGO_BIN_EXE_mqtt_ac"))
         .args([NAME, broker.address().as_str(), refused_address().as_str()])
         .current_dir(&dir)
@@ -150,14 +229,14 @@ async fn sigterm_during_a_stalled_logging_start_stops_the_bridge_within_its_boun
         .spawn()
         .expect("start the bridge");
 
-    // Time to start, take the stop signals and reach the open that does not return; well inside
-    // tracing-init's 5 s bound on it.
+    // Time to start, take the stop signals and reach the open that does not return.
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let held = broker.connections() == 0;
     let pid = bridge.id().expect("the bridge's pid").to_string();
     let sent = std::process::Command::new("kill").args(["-TERM", &pid]).status();
     assert!(sent.is_ok_and(|s| s.success()), "could not send SIGTERM to the bridge");
+    let signalled = std::time::Instant::now();
 
-    let started = std::time::Instant::now();
     let status = match tokio::time::timeout(Duration::from_secs(15), bridge.wait()).await {
         Ok(status) => status.expect("the bridge's exit status"),
         Err(_) => {
@@ -165,10 +244,21 @@ async fn sigterm_during_a_stalled_logging_start_stops_the_bridge_within_its_boun
             panic!("the bridge did not exit within 15 s of SIGTERM while its logging start was stalled");
         }
     };
-    let took = started.elapsed();
+    let (since_spawn, since_signal) = (spawned.elapsed(), signalled.elapsed());
+    // The FIFO stays unopened until the bridge is gone (it is removed with the directory next run).
     assert!(
-        status.success() && took < Duration::from_millis(2500),
-        "the bridge did not stop cleanly within its bound on SIGTERM while its logging start was stalled: {status} \
-         after {took:?}"
+        held && broker.connections() == 0,
+        "the bridge reached its service, so its logging start was not held and this test proves nothing"
+    );
+    assert!(
+        status.success() && since_spawn < Duration::from_millis(4500),
+        "the bridge did not stop cleanly within its bound on SIGTERM while its logging start was stalled: {status}, \
+         {since_spawn:?} after its spawn and {since_signal:?} after the signal (it must be gone within 4.5 s of its \
+         spawn; waiting out the start takes at least 5 s)"
+    );
+    assert!(
+        since_signal >= Duration::from_millis(900),
+        "the bridge exited {since_signal:?} after the signal, before the runtime's 1 s grace ran out: no thread was \
+         still in the logging start, so this test proves nothing"
     );
 }

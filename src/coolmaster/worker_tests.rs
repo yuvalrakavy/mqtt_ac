@@ -423,6 +423,31 @@ async fn a_coolmaster_outage_publishes_its_error_once_while_it_does_not_change()
     );
 }
 
+/// Before the first connect the Coolmaster is not connected, and the mailbox says so (re-review
+/// C10): a momentary command posted then is refused, a state is held for the first connection. A
+/// mailbox that starts "connected" queues the momentary command, and the first connection — however
+/// late — applies it.
+#[tokio::test]
+async fn before_the_first_connect_a_momentary_command_is_refused_and_a_state_held() {
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.cap_connections(SPIN_CAP);
+    let rig = Rig::start(coolmaster.address.clone(), paced());
+    // Posted before the worker has run at all (the test's runtime runs one task at a time).
+    let momentary = rig.mailbox.post(ResetFilter(UNIT.to_owned()));
+    let state = rig.mailbox.post(SetUnitPower(UNIT.to_owned(), true));
+    let listed = eventually(Duration::from_secs(5), || received(&coolmaster, "ls2") > 0).await;
+    let commands = coolmaster.commands();
+    drop(rig);
+    assert!(listed, "the worker never listed the units: {commands:?}");
+    assert!(
+        momentary == Posted::Refused(Refusal::CoolmasterDown)
+            && state == Posted::Queued
+            && commands == ["on L1.001", "ls2"],
+        "before the first connect, a momentary command should be refused and a state held for it: the ResetFilter \
+         was {momentary:?}, and the Coolmaster received {commands:?}"
+    );
+}
+
 /// The worker has found the Coolmaster down and said so on the error topic.
 async fn reported_down(rig: &Rig) -> bool {
     eventually(Duration::from_secs(5), || {

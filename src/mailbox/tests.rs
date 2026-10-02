@@ -25,6 +25,29 @@ fn down() -> std::sync::Arc<Mailbox> {
     mailbox
 }
 
+/// A mailbox whose worker has connected to the Coolmaster.
+fn up() -> std::sync::Arc<Mailbox> {
+    let mailbox = Mailbox::new();
+    assert_eq!(mailbox.connected(), 0);
+    mailbox
+}
+
+/// Until the worker's first connect, the Coolmaster is down (C10): a momentary command is refused
+/// and a state is held; the first connect hands the held state to the catch-up.
+#[test]
+fn a_new_mailbox_is_down_until_the_first_connect() {
+    let mailbox = Mailbox::new();
+    assert_eq!(
+        mailbox.post(ResetFilter(U1.to_owned())),
+        Posted::Refused(Refusal::CoolmasterDown),
+        "a momentary command was taken before the first connect"
+    );
+    assert_eq!(mailbox.post(PublishUnitsState), Posted::Dropped);
+    assert_eq!(mailbox.post(power(U1, true)), Posted::Queued);
+    assert_eq!(mailbox.connected(), 1);
+    assert_eq!(held(&mailbox), [power(U1, true)]);
+}
+
 /// Every held state, taken as the worker's catch-up takes them.
 fn held(mailbox: &Mailbox) -> Vec<ToCoolmasterMessage> {
     std::iter::from_fn(|| mailbox.take_held()).collect()
@@ -130,7 +153,7 @@ fn reads_are_dropped_while_down_and_coalesced_while_up() {
 
 #[test]
 fn momentary_commands_past_the_cap_are_refused() {
-    let mailbox = Mailbox::new();
+    let mailbox = up();
     for _ in 0..MOMENTARY_CAP {
         assert_eq!(mailbox.post(ResetFilter(U1.to_owned())), Posted::Queued);
     }
@@ -144,7 +167,7 @@ fn momentary_commands_past_the_cap_are_refused() {
 
 #[test]
 fn momentary_commands_waiting_when_the_coolmaster_goes_down_are_refused() {
-    let mailbox = Mailbox::new();
+    let mailbox = up();
     mailbox.post(ResetFilter(U1.to_owned()));
     mailbox.post(PublishUnitState(U1.to_owned()));
     mailbox.post(power(U1, true));
@@ -207,7 +230,7 @@ fn the_first_refusal_of_an_outage_is_logged_at_info_and_the_rest_at_debug() {
 #[tokio::test]
 async fn a_full_momentary_queue_is_said_once_per_episode() {
     let log = Capture::start();
-    let mailbox = Mailbox::new();
+    let mailbox = up();
     for _ in 0..MOMENTARY_CAP + 3 {
         mailbox.post(ResetFilter(U1.to_owned()));
     }
@@ -247,7 +270,7 @@ fn nothing_is_logged_under_the_mailbox_lock() {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    let mailbox = Mailbox::new();
+    let mailbox = up();
     // Each event as it is emitted: was the mailbox's lock held?
     let (under_lock, events) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
     let _watch = {
@@ -284,7 +307,7 @@ fn nothing_is_logged_under_the_mailbox_lock() {
 /// whether or not anything takes them.
 #[tokio::test]
 async fn take_waits_for_a_post_and_a_post_never_waits() {
-    let mailbox = Mailbox::new();
+    let mailbox = up();
     let taker = {
         let mailbox = mailbox.clone();
         tokio::spawn(async move { mailbox.take().await })

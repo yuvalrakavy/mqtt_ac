@@ -23,6 +23,12 @@ use tracing::{error, info, warn};
 use tracing_init::types::OnDestinationError;
 use tracing_init::TracingGuard;
 
+/// The bridge writes nothing to stdout or stderr itself (re-review B2): a supervisor's pipe that has
+/// stopped draining would hold the writer, outside every bound. Its messages go through
+/// tracing-init's lossy sinks; the one it can have before the logging is up — the logging's own
+/// failure — is written by the thread of the raced start (`start_logging`), and the rest before then
+/// go nowhere: the exit status says it. The one exemption is the command line's own output (`--help`,
+/// and a usage error) from `parse_or_exit`, before anything has started.
 fn main() -> ExitCode {
     let (args, _) = opts! {
         synopsis "MQTT Coolmaster (aircondition) Controller";
@@ -39,12 +45,9 @@ fn main() -> ExitCode {
         timing: Default::default(),
     };
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            eprintln!("The async runtime cannot start ({e}); not starting");
-            return ExitCode::FAILURE;
-        }
+    // No runtime, no bridge: said by the status alone (see above).
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread().enable_all().build() else {
+        return ExitCode::FAILURE;
     };
     // WAIT: runtime
     let exit = runtime.block_on(run(config));
@@ -86,8 +89,8 @@ async fn run(config: ServiceConfig) -> ExitCode {
             // WAIT: logging-start
             tokio::select! {
                 started = starting => started,
-                signal = signals.next() => {
-                    eprintln!("Stop requested ({signal}) before the logging started; stopping");
+                _ = signals.next() => {
+                    // Stopped before there is a log to say so in.
                     return ExitCode::SUCCESS;
                 }
             }
@@ -97,20 +100,12 @@ async fn run(config: ServiceConfig) -> ExitCode {
             starting.await
         }
     };
-    let _logging: Option<TracingGuard> = match logging {
-        Ok(Ok(guard)) => {
-            println!("Logging: {guard}");
-            Some(guard)
-        }
-        Ok(Err(e)) => {
-            eprintln!("Logging did not start ({e}); running without it");
-            None
-        }
-        Err(e) => {
-            eprintln!("Logging did not start ({e}); running without it");
-            None
-        }
-    };
+    // A start that failed said so on its own thread (`start_logging`); one that panicked, through
+    // the panic hook, on that thread too.
+    let _logging: Option<TracingGuard> = logging.ok().flatten();
+    if let Some(guard) = &_logging {
+        info!(logging = %guard, "Logging started");
+    }
 
     error_stack::Report::set_color_mode(error_stack::fmt::ColorMode::None);
 
@@ -118,7 +113,6 @@ async fn run(config: ServiceConfig) -> ExitCode {
         Ok(signals) => signals,
         Err(e) => {
             warn!(kind = "signal_handler_unavailable", error = %e, "The stop signals cannot be handled; not starting");
-            eprintln!("The stop signals cannot be handled ({e}); not starting");
             return ExitCode::FAILURE;
         }
     };
@@ -130,9 +124,11 @@ async fn run(config: ServiceConfig) -> ExitCode {
     }
 }
 
-/// tracing-init's start, synchronous.
-fn start_logging() -> Result<TracingGuard, String> {
-    tracing_init::TracingInit::builder("mqtt_ac")
+/// tracing-init's start, synchronous, on the raced start's thread. Its failure is the one message
+/// written to stderr directly: there is no log to say it in, and a stderr nobody drains holds only
+/// this thread — the start, which a stop ends regardless — never the bridge's stop.
+fn start_logging() -> Option<TracingGuard> {
+    let started = tracing_init::TracingInit::builder("mqtt_ac")
         .log_to_file(true)
         .log_to_gelf_server(true)
         .file_prefix("ac")
@@ -140,8 +136,14 @@ fn start_logging() -> Result<TracingGuard, String> {
         // Telemetry never stops the bridge: a destination that fails is skipped whatever
         // logging.toml says, and if the logging cannot start at all the bridge runs without it.
         .on_destination_error(OnDestinationError::Skip)
-        .init()
-        .map_err(|e| e.to_string())
+        .init();
+    match started {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!("Logging did not start ({e}); running without it");
+            None
+        }
+    }
 }
 
 /// How the bridge ended.
