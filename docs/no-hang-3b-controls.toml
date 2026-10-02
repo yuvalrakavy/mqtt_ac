@@ -2,11 +2,20 @@
 #     scripts/negative-control.py --root ../Home/mqtt_ac-3b ../Home/mqtt_ac-3b/docs/no-hang-3b-controls.toml
 # (The saturation tests' own controls are the failing-first runs: on the session that polled,
 # 2 of 300 error publishes and 2 of 300 unit states arrived after the broker recovered, and the
-# bridge never reconnected after its connection dropped.)
+# bridge never reconnected after its connection dropped. The fix round's failing-first runs, on
+# a9e654a: the broker blip with the Coolmaster down was never re-announced; every command set
+# while the Coolmaster was down was replayed; the ResetFilter got no error; the state a reconnect
+# dropped was never sent again; the broker outage was logged per session; the unread commands
+# were dropped silently; SIGTERM killed the bridge.)
+#
+# A row that drove the Coolmaster path through the pump's forward queue
+# (`the_pump_blocks_on_its_forward_queue_coolmaster_path`) is gone: with the mailbox the session
+# never waits on the Coolmaster, so that mutation alone can no longer wedge anything — the row came
+# back GREEN against `a_burst_of_unit_commands_…`. The guard it stood for is now
+# `the_session_waits_for_the_coolmaster`.
 
 # The pump waits while its forward queue holds more than 10 unread commands: a bounded forward
-# queue that blocks. One mutation, two rows: each test drives a different cycle through it (the
-# publisher's queue; the Coolmaster worker's queue, then the publisher's).
+# queue that blocks. The session drives the cycle through the publisher's queue.
 [[control]]
 name        = "the_pump_blocks_on_its_forward_queue_publisher_path"
 file        = "src/mqtt_pump.rs"
@@ -22,49 +31,44 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", 
 expect_text = "error publishes arrived after the broker recovered"
 guard       = "pump_never_waits_on_the_session"
 
-[[control]]
-name        = "the_pump_blocks_on_its_forward_queue_coolmaster_path"
-file        = "src/mqtt_pump.rs"
-anchor      = '''                    backlog.pushed();
-                    PumpEvent::Publish(publish)'''
-replacement = '''                    backlog.pushed();
-                    while backlog.depth.load(Ordering::SeqCst) > 10 {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                    PumpEvent::Publish(publish)'''
-target      = "command"
-argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_burst_of_unit_commands_against_a_stalled_broker"]
-expect_text = "unit states arrived after the broker recovered"
-guard       = "pump_never_waits_on_the_session"
-
 # The announcement made once per session, before the loop (the shape of a bridge that reconnects
 # by building a new client), instead of on every CONNACK: rumqttc reconnects inside one event loop
 # and the broker keeps no session, so after a drop the bridge is never subscribed again.
 [[control]]
 name        = "the_announcement_is_made_once_per_session"
 file        = "src/mqtt_subscriber.rs"
-anchor      = '''    let (_pump, mut incoming) = Pump::start(mqtt_event_loop);
+anchor      = '''    let (_pump, mut incoming) = Pump::start(mqtt_event_loop, outage);
 
     loop {
         debug!("Waiting for MQTT message");
 
-        let publish_packet = match incoming.recv().await { // WAIT: mqtt-pump-queue
+        // WAIT: mqtt-pump-queue
+        let event = incoming.recv().await;
+        let publish_packet = match event {
             Some(PumpEvent::Publish(publish_packet)) => publish_packet,
             Some(PumpEvent::Connected) => {
-                announce(&mqtt_client, &active_topic, &version_topic, &version, &command_topic)
+                let topics = [&command_topic, &active_topic, &version_topic];
+                announce(&mqtt_client, topics, &version)
                     .await
                     .change_context_lazy(into_context)?;
+                // A reconnect without a session dropped whatever rumqttc still held: the
+                // publisher sends again the retained state it knows.
+                reconnected.notify_one();
                 continue;
             }'''
-replacement = '''    let (_pump, mut incoming) = Pump::start(mqtt_event_loop);
-    announce(&mqtt_client, &active_topic, &version_topic, &version, &command_topic)
+replacement = '''    let (_pump, mut incoming) = Pump::start(mqtt_event_loop, outage);
+    let topics = [&command_topic, &active_topic, &version_topic];
+    announce(&mqtt_client, topics, &version)
         .await
         .change_context_lazy(into_context)?;
+    reconnected.notify_one();
 
     loop {
         debug!("Waiting for MQTT message");
 
-        let publish_packet = match incoming.recv().await { // WAIT: mqtt-pump-queue
+        // WAIT: mqtt-pump-queue
+        let event = incoming.recv().await;
+        let publish_packet = match event {
             Some(PumpEvent::Publish(publish_packet)) => publish_packet,
             Some(PumpEvent::Connected) => continue,'''
 target      = "command"
@@ -86,10 +90,10 @@ guard       = "collision_cleared_on_error"
 [[control]]
 name        = "the_backlog_never_raises_its_warn"
 file        = "src/mqtt_pump.rs"
-anchor      = '''            if high.is_none() {
-                *high = Some(Instant::now());'''
-replacement = '''            if false {
-                *high = Some(Instant::now());'''
+anchor      = '''        if depth >= HIGH_WATER
+            && self'''
+replacement = '''        if depth >= usize::MAX
+            && self'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_backlog_past_high_water"]
 expect_text = "not flagged at the high-water mark"
@@ -98,19 +102,214 @@ guard       = "backlog_high_water"
 [[control]]
 name        = "a_wait_loses_its_tag"
 file        = "src/mqtt_pump.rs"
-anchor      = '''        let event = self.rx.recv().await; // WAIT: mqtt-pump-queue'''
+anchor      = '''        // WAIT: mqtt-pump-queue
+        let event = self.rx.recv().await;'''
 replacement = '''        let event = self.rx.recv().await;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "wait_registry"]
 expect_text = "is an untagged wait"
 guard       = "registry_wired"
 
+# C-4: `poll` is a declared wait method, so the pump's poll needs its tag.
+[[control]]
+name        = "the_poll_loses_its_tag"
+file        = "src/mqtt_pump.rs"
+anchor      = '''            // WAIT: mqtt-poll
+            let event = match events.poll().await {'''
+replacement = '''            let event = match events.poll().await {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "wait_registry"]
+expect_text = "is an untagged wait"
+guard       = "poll_is_a_wait"
+
 [[control]]
 name        = "a_collision_is_undeclared"
 file        = "docs/wait-registry.md"
-anchor      = '''local-methods = connect_to, handle_message, run_session'''
-replacement = '''local-methods = handle_message, run_session'''
+anchor      = '''local-methods = connect_to, handle_message, catch_up, lost'''
+replacement = '''local-methods = handle_message, catch_up, lost'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "wait_registry"]
 expect_text = "`.connect_to(..).await` on a receiver other than `self`"
 guard       = "collision_declared"
+
+# C-B3: the session waits until the Coolmaster worker has taken what it posted — the shape of the
+# bounded queue it used to send on. With the Coolmaster down nothing is taken, so the session never
+# reads the CONNACK after a broker blip. (`--bin`: `Mailbox::waiting` exists in test builds only.)
+[[control]]
+name        = "the_session_waits_for_the_coolmaster"
+file        = "src/mqtt_subscriber.rs"
+anchor      = '''    if let Posted::Refused(why) = mailbox.post(command.clone()) {'''
+replacement = '''    let posted = mailbox.post(command.clone());
+    while !mailbox.waiting().is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    if let Posted::Refused(why) = posted {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "a_broker_blip_while_the_coolmaster_is_down"]
+expect_text = "did not announce itself and resubscribe"
+guard       = "session_never_waits_on_the_device"
+
+# The device-down policy: a state no longer replaces the waiting one for its unit and property, so
+# every value set while the Coolmaster was down is replayed on its return.
+[[control]]
+name        = "every_state_set_while_down_is_replayed"
+file        = "src/mailbox.rs"
+anchor      = '''        if let Some(i) = self
+            .pending
+            .iter()
+            .position(|e| e.key.as_ref() == Some(&key))
+        {
+            self.pending.remove(i);
+        }'''
+replacement = '''        // control: nothing replaced'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "state_set_while_the_coolmaster_is_down"]
+expect_text = "only the latest value per unit and property should have waited"
+guard       = "state_latest_per_key"
+
+# A momentary command is kept while the Coolmaster is down, and replayed on its return.
+[[control]]
+name        = "a_momentary_command_waits_while_down"
+file        = "src/mailbox.rs"
+anchor      = '''                    let why = if !state.connected {'''
+replacement = '''                    let why = if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_reset_filter_while_the_coolmaster_is_down"]
+expect_text = "no error was published for the ResetFilter"
+guard       = "momentary_refused_while_down"
+
+# A read is kept while the Coolmaster is down.
+[[control]]
+name        = "a_read_waits_while_down"
+file        = "src/mailbox.rs"
+anchor      = '''                Class::Read(key) if state.connected => {'''
+replacement = '''                Class::Read(key) if true => {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_coolmaster_down_from_the_start_holds_state_only"]
+expect_text = "a read should be dropped"
+guard       = "read_dropped_while_down"
+
+# On its return the Coolmaster's units are not listed, so their observed state is not published.
+[[control]]
+name        = "the_observed_state_is_not_read_on_return"
+file        = "src/coolmaster.rs"
+anchor      = '''        if let Err(e) = self.handle_message(&list, publisher).await {'''
+replacement = '''        if let Err(e) = Ok::<(), Report<CoolmasterError>>(()) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "state_set_while_the_coolmaster_is_down"]
+expect_text = "the units' observed state was not read after the pending state was applied"
+guard       = "observed_state_on_return"
+
+# A listing the bridge cannot use, at the return, is taken for a lost connection: the worker
+# reconnects as fast as the Coolmaster answers and never reaches its mailbox.
+[[control]]
+name        = "an_unusable_listing_is_a_lost_connection"
+file        = "src/coolmaster.rs"
+anchor      = '''            if connection_failed(&e) {'''
+replacement = '''            if true || connection_failed(&e) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_listing_the_bridge_cannot_use"]
+expect_text = "was taken for a lost connection"
+guard       = "catch_up_never_loops"
+
+# The state being applied when the connection dropped is not put back: it is lost.
+[[control]]
+name        = "the_state_in_flight_at_a_drop_is_lost"
+file        = "src/coolmaster.rs"
+anchor      = '''                    mailbox.restore(vec![message]);'''
+replacement = '''                    // control: not restored'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_coolmaster_outage_is_applied_refused_and_logged_as_one_episode"]
+expect_text = "should get the state in flight at the drop"
+guard       = "in_flight_state_restored"
+
+# C-10: a refusal logged while the mailbox's lock is held.
+[[control]]
+name        = "the_mailbox_logs_under_its_lock"
+file        = "src/mailbox.rs"
+anchor      = '''                            refusal = Some((why, state.refuse(why)));'''
+replacement = '''                            refusal = Some((why, state.refuse(why)));
+                            log_refusal(&command, why, false);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "nothing_is_logged_under_the_mailbox_lock"]
+expect_text = "the mailbox logged while holding its lock"
+guard       = "no_log_under_mailbox_lock"
+
+# C-2: the session no longer tells the publisher about a CONNACK, so the state a clean-start
+# reconnect dropped is never published again.
+[[control]]
+name        = "the_publisher_is_not_told_of_a_reconnect"
+file        = "src/mqtt_subscriber.rs"
+anchor      = '''                reconnected.notify_one();
+                continue;'''
+replacement = '''                let _ = &reconnected;
+                continue;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_state_a_reconnect_dropped"]
+expect_text = "never sent it again"
+guard       = "republish_on_connack"
+
+# C-5: the broker's outage state made per session, as it was: each session's first failed poll is
+# the start of a new outage.
+[[control]]
+name        = "the_broker_outage_is_per_session"
+file        = "src/service.rs"
+anchor      = '''                to_mqtt_publisher_tx.clone(),
+                &outage,'''
+replacement = '''                to_mqtt_publisher_tx.clone(),
+                &Arc::new(BrokerOutage::new(timing.broker_warn_after)),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_broker_outage_across_sessions"]
+expect_text = "the outage's start was not one INFO `connection_lost`"
+guard       = "broker_outage_outlives_sessions"
+
+# C-6: the commands left unread when a session ends are dropped without a word.
+[[control]]
+name        = "unread_commands_are_dropped_silently"
+file        = "src/mqtt_pump.rs"
+anchor      = '''        if depth > 0 {
+            warn!('''
+replacement = '''        if false {
+            warn!('''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "commands_left_unread_when_the_session_ends"]
+expect_text = "dropped silently"
+guard       = "discarded_commands_said"
+
+# C-6: the session's standing high-water episode is left open when the session ends.
+[[control]]
+name        = "the_backlog_episode_outlives_its_session"
+file        = "src/mqtt_pump.rs"
+anchor      = '''        self.backlog.close(depth, true);'''
+replacement = '''        // control: the episode is left open'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "commands_left_unread_when_the_session_ends"]
+expect_text = "was never closed"
+guard       = "backlog_episode_closed_at_session_end"
+
+# C-7: SIGTERM is not one of the stop signals (a user-defined signal in its place), so it kills the
+# bridge: no bounded shutdown, and `main` never returns to drop tracing-init's guard.
+[[control]]
+name        = "sigterm_is_not_a_stop_signal"
+file        = "src/main.rs"
+anchor      = '''            terminate: signal(SignalKind::terminate())?,'''
+replacement = '''            terminate: signal(SignalKind::user_defined1())?,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "sigterm"]
+expect_text = "did not stop cleanly on -TERM"
+guard       = "sigterm_handled"
+
+# C-9: the shutdown bound removed: a stop that never ends holds `main` for good.
+[[control]]
+name        = "the_shutdown_is_unbounded"
+file        = "src/main.rs"
+anchor      = '''    let ended = tokio::time::timeout(grace, stop).await.is_ok();'''
+replacement = '''    let ended = {
+        let _ = grace;
+        stop.await;
+        true
+    };'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_shutdown_past_its_bound"]
+expect_text = "a shutdown that never ends was not cut short at its bound"
+guard       = "shutdown_bounded"
