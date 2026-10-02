@@ -74,13 +74,21 @@ impl Relay {
 /// The units the stand-in Coolmaster lists.
 pub const UNITS: [&str; 2] = ["L1.001", "L1.002"];
 
+/// The connections a stand-in Coolmaster serves at most, by default (see `FakeCoolmaster`).
+pub const CONNECTION_CAP: usize = 50;
+
 /// A Coolmaster stand-in on `127.0.0.1`: the `>` prompt, then one reply per `\r`-terminated
 /// command. `ls2` lists every unit of `UNITS` and `ls2 <unit>` that one; every other command
 /// answers `OK`. By default the room temperature moves on every listing, so each one is a state
 /// change, which the publisher publishes (it publishes only what changed); a steady one lists the
 /// same state every time. While it is down it takes each connection and closes it at once, before
-/// the prompt — a Coolmaster that cannot be reached — and the connections it held are cut. Its
-/// listings can be garbled: answered `OK`, with lines no unit state parses from.
+/// the prompt — a Coolmaster that cannot be reached — and the connections it held are cut. A
+/// command can be given another answer (`answer`).
+///
+/// It serves at most `CONNECTION_CAP` connections (fewer with `cap_connections`) and closes the
+/// rest at once, as while down. A worker that reconnects in a loop is then caught after a few
+/// connections: uncapped, it opens thousands a second, and their TIME_WAIT sockets use up the
+/// machine's ephemeral ports — every process's on this host, for half a minute.
 pub struct FakeCoolmaster {
     pub address: String,
     shared: Arc<CoolmasterShared>,
@@ -90,10 +98,12 @@ pub struct FakeCoolmaster {
 struct CoolmasterShared {
     up: AtomicBool,
     steady: bool,
-    garbled: AtomicBool,
+    /// Commands answered otherwise, by the prefix they start with; the first match wins.
+    answers: Mutex<Vec<(String, Answer)>>,
     listings: AtomicUsize,
-    /// Connections served (taken while up).
+    /// Connections served (taken while up, under the cap).
     served: AtomicUsize,
+    cap: AtomicUsize,
     /// Every command the Coolmaster answered, in order.
     commands: Mutex<Vec<String>>,
     connections: Mutex<Vec<JoinHandle<()>>>,
@@ -127,16 +137,19 @@ impl FakeCoolmaster {
         let shared = Arc::new(CoolmasterShared {
             up: AtomicBool::new(true),
             steady,
-            garbled: AtomicBool::new(false),
+            answers: Mutex::new(Vec::new()),
             listings: AtomicUsize::new(0),
             served: AtomicUsize::new(0),
+            cap: AtomicUsize::new(CONNECTION_CAP),
             commands: Mutex::new(Vec::new()),
             connections: Mutex::new(Vec::new()),
         });
         let serving = shared.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                if !serving.up.load(Ordering::SeqCst) {
+                let cap = serving.cap.load(Ordering::SeqCst);
+                let capped = serving.served.load(Ordering::SeqCst) >= cap;
+                if capped || !serving.up.load(Ordering::SeqCst) {
                     drop(stream);
                     continue;
                 }
@@ -165,9 +178,20 @@ impl FakeCoolmaster {
         self.shared.commands.lock().unwrap().clone()
     }
 
-    /// Garble its listings from now on, or stop.
-    pub fn garble_listings(&self, garbled: bool) {
-        self.shared.garbled.store(garbled, Ordering::SeqCst);
+    /// From now on, answer the commands that start with `prefix` (every one, for `""`) so.
+    pub fn answer(&self, prefix: &str, answer: Answer) {
+        let mut answers = self.shared.answers.lock().unwrap();
+        answers.push((prefix.to_owned(), answer));
+    }
+
+    /// From now on, answer every command as a Coolmaster does.
+    pub fn answer_normally(&self) {
+        self.shared.answers.lock().unwrap().clear();
+    }
+
+    /// Serve at most `cap` connections in all (`CONNECTION_CAP` by default).
+    pub fn cap_connections(&self, cap: usize) {
+        self.shared.cap.store(cap, Ordering::SeqCst);
     }
 
     /// How many connections it has served.
@@ -180,6 +204,18 @@ impl FakeCoolmaster {
             connection.abort();
         }
     }
+}
+
+/// How the stand-in Coolmaster answers a command, in place of its own answer.
+#[derive(Debug, Clone, Copy)]
+pub enum Answer {
+    /// `OK`, after a body that is not text (bytes that are not UTF-8): nothing the bridge can use,
+    /// and not a refusal either.
+    Unusable,
+    /// An error status: the Coolmaster refused the command (an unknown unit, say).
+    Rejected,
+    /// No answer: the connection is closed.
+    Close,
 }
 
 async fn serve_coolmaster(stream: TcpStream, shared: Arc<CoolmasterShared>) {
@@ -197,9 +233,16 @@ async fn serve_coolmaster(stream: TcpStream, shared: Arc<CoolmasterShared>) {
         }
         let command = String::from_utf8_lossy(&line).trim().to_owned();
         shared.commands.lock().unwrap().push(command.clone());
-        let reply = match command.strip_prefix("ls2") {
-            Some(_) if shared.garbled.load(Ordering::SeqCst) => "#garbled#\r\nOK\r\n>".to_owned(),
-            Some(unit) => {
+        let answer = {
+            let answers = shared.answers.lock().unwrap();
+            let matches = |(prefix, _): &&(String, Answer)| command.starts_with(prefix.as_str());
+            answers.iter().find(matches).map(|(_, answer)| *answer)
+        };
+        let reply = match (answer, command.strip_prefix("ls2")) {
+            (Some(Answer::Close), _) => return,
+            (Some(Answer::Unusable), _) => b"\xff\xfe\r\nOK\r\n>".to_vec(),
+            (Some(Answer::Rejected), _) => b"ERROR: 1\r\n>".to_vec(),
+            (None, Some(unit)) => {
                 let n = shared.listings.fetch_add(1, Ordering::SeqCst);
                 let room = if shared.steady { 25 } else { 10 + n % 50 };
                 let unit = unit.trim();
@@ -208,11 +251,11 @@ async fn serve_coolmaster(stream: TcpStream, shared: Arc<CoolmasterShared>) {
                     .filter(|u| unit.is_empty() || **u == unit)
                     .map(|u| format!("{u} ON 22.0C {room}.0C High Cool OK - 0"))
                     .collect();
-                format!("{}\r\nOK\r\n>", lines.join("\r\n"))
+                format!("{}\r\nOK\r\n>", lines.join("\r\n")).into_bytes()
             }
-            None => "OK\r\n>".to_owned(),
+            (None, None) => b"OK\r\n>".to_vec(),
         };
-        if wr.write_all(reply.as_bytes()).await.is_err() {
+        if wr.write_all(&reply).await.is_err() {
             return;
         }
     }

@@ -53,7 +53,7 @@ MQTT Subscriber ──↗                                        │
 ```
 
 **Workers** (spawned in `service.rs` via `tokio::task::JoinSet`):
-- **Coolmaster Worker** (`coolmaster.rs`): TCP connection to Coolmaster controller. Takes commands from the mailbox only while connected, executes them, sends results back. Auto-reconnects on failure (5s retry); on each reconnect it applies the state set while it was down, then lists every unit and publishes its observed state.
+- **Coolmaster Worker** (`coolmaster.rs`): TCP connection to Coolmaster controller. Takes commands from the mailbox only while connected, executes them, sends results back. Auto-reconnects on failure (5s retry, and never sooner than 5s after its last connect); on each reconnect it applies the state set while it was down, then lists every unit and publishes its observed state. Only a failed *connection* is a reconnect: a command the Coolmaster refuses (WARN `command_rejected`) or answers with something unusable is reported on the error topic and passed over on the same connection, never retried. While the Coolmaster is unreachable its error is published on the first attempt and then only when it changes.
 - **MQTT Worker** (`service.rs`): Manages MQTT connection lifecycle: a session after another (10s retry), each with a fresh client, its publisher half and its subscriber half. The publisher (and the retained state it knows) and the broker's outage state outlive the sessions.
 - **Polling Worker** (`polling.rs`): Posts `PublishUnitsState` every N seconds (default 4s).
 
@@ -113,6 +113,13 @@ Log levels follow the fleet policy at `~/Documents/Projects/Store/docs/guides/lo
 - **DEBUG** — per-iteration detail (polling ticks, message receipt)
 
 External outages (MQTT broker unreachable, Coolmaster unreachable) are each one episode: an INFO when it starts, retries at DEBUG, one WARN once it has lasted 30 s, an INFO with its length when it ends (kinds above). Orderly shutdown of channels is INFO (not WARN/ERROR).
+
+Kinds this bridge emits: broker — `connection_lost` (INFO), `external_failure` (WARN, the broker outage only), `external_recovered` (INFO); Coolmaster — `device_connection_lost` (INFO), `device_unreachable` (WARN), `device_recovered` (INFO), `command_refused` (INFO, a momentary command while the Coolmaster is down), `command_rejected` (WARN, a command the Coolmaster refused: fix the unit id or the config); MQTT queue — `mqtt_backlog_high` (WARN), `mqtt_backlog_drained` (INFO), `mqtt_commands_discarded` (WARN); `validation_rejected` (INFO, a malformed command payload); `shutdown_timeout` (WARN); `signal_handler_unavailable` (WARN).
+
+## Not done (deliberately, for later)
+
+- **The error topic is retained** (`Aircondition/Error/{controller}` is published with retain), though the house topic rules never retain `Error`. It changes with the topic-grammar migration of this bridge and its SDL driver, together.
+- **No explicit `Active=false` or DISCONNECT at shutdown.** The bounded shutdown aborts the workers, and the connection closes without a DISCONNECT, so the broker publishes the last will (`Active=false`, retained). A clean DISCONNECT would suppress the will and need an explicit `Active=false` publish first.
 
 This bridge joins distributed traces via MQTT v5 `traceparent` user properties:
 - **Inbound**: `traceparent` user property extracted from each Publish packet; span created with `tracing_init::traceparent::set_remote_parent` before entering

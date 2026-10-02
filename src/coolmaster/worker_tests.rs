@@ -7,9 +7,32 @@ use std::time::Duration;
 use super::{Coolmaster, DeviceTiming};
 use crate::mailbox::{Mailbox, Posted, Refusal};
 use crate::messages::ToCoolmasterMessage::{self, *};
-use crate::test_support::{Capture, FakeCoolmaster, UNITS};
+use crate::test_support::{Answer, Capture, FakeCoolmaster, UNITS};
 
 const UNIT: &str = UNITS[0];
+
+/// The worker's pacing in the tests that count its connections.
+const RETRY: Duration = Duration::from_millis(300);
+
+/// The connections a stand-in serves in the tests where a regression reconnects in a loop: enough
+/// for the worker as it should be, few enough to catch the loop at once.
+const SPIN_CAP: usize = 12;
+
+fn paced() -> DeviceTiming {
+    DeviceTiming {
+        retry: RETRY,
+        warn_after: Duration::from_secs(30),
+    }
+}
+
+/// How many of these the Coolmaster received.
+fn received(coolmaster: &FakeCoolmaster, command: &str) -> usize {
+    coolmaster
+        .commands()
+        .iter()
+        .filter(|c| *c == command)
+        .count()
+}
 
 /// Wait until `ready` holds, or `within` passes. Returns whether it held.
 async fn eventually(within: Duration, mut ready: impl FnMut() -> bool) -> bool {
@@ -193,7 +216,8 @@ async fn a_coolmaster_outage_is_applied_refused_and_logged_as_one_episode() {
 #[tokio::test]
 async fn a_listing_the_bridge_cannot_use_does_not_keep_the_worker_from_its_mailbox() {
     let coolmaster = FakeCoolmaster::start().await;
-    coolmaster.garble_listings(true);
+    coolmaster.cap_connections(SPIN_CAP);
+    coolmaster.answer("ls2", Answer::Unusable);
     let timing = DeviceTiming {
         retry: Duration::from_millis(100),
         warn_after: Duration::from_secs(30),
@@ -282,5 +306,143 @@ async fn a_coolmaster_down_from_the_start_holds_state_only() {
         commands,
         ["off L1.001", "ls2"],
         "only the state should have waited for the Coolmaster"
+    );
+}
+
+/// A command the Coolmaster answers with something the bridge cannot use (a reply that is not
+/// text) failed; the connection did not. It is reported once and passed over, on the same
+/// connection, and the next command is served. Taken for a lost connection, it is put back and
+/// tried again first thing on a reconnect made at once: the worker spins — connect, apply, fail —
+/// as fast as the Coolmaster answers, and never reaches the next command.
+#[tokio::test]
+async fn a_command_answered_with_something_unusable_is_passed_over_on_the_same_connection() {
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.cap_connections(SPIN_CAP);
+    coolmaster.answer("on ", Answer::Unusable);
+    let rig = Rig::start(coolmaster.address.clone(), paced());
+    assert!(
+        eventually(Duration::from_secs(5), || received(&coolmaster, "ls2") > 0).await,
+        "the worker never connected and listed the units"
+    );
+    rig.mailbox.post(SetUnitPower(UNIT.to_owned(), true));
+    rig.mailbox
+        .post(SetTargetTemperature(UNIT.to_owned(), 22.0));
+    let next = eventually(Duration::from_secs(3), || {
+        received(&coolmaster, "temp L1.001 22") > 0
+    })
+    .await;
+    // A window for a loop, if there is one, to show.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (served, tries) = (coolmaster.served(), received(&coolmaster, "on L1.001"));
+    let reports = rig
+        .published()
+        .iter()
+        .filter(|p| p.starts_with("Error") && p.contains("SetUnitPower"))
+        .count();
+    drop(rig);
+    assert!(
+        next && served == 1 && tries == 1 && reports == 1,
+        "a command answered with something unusable was not passed over on its connection: {served} connections, \
+         tried {tries} times, reported {reports} times, and the next command {} the Coolmaster",
+        if next { "reached" } else { "never reached" }
+    );
+}
+
+/// A Coolmaster that takes the connection and closes it on the first command, every time: the
+/// worker reconnects at its retry pace, no faster, and once the Coolmaster answers again the
+/// mailbox is served. Reconnecting at once, the worker spins as fast as the Coolmaster closes.
+#[tokio::test]
+async fn a_coolmaster_that_closes_on_every_command_is_reconnected_to_at_the_retry_pace() {
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.cap_connections(SPIN_CAP);
+    coolmaster.answer("", Answer::Close);
+    let rig = Rig::start(coolmaster.address.clone(), paced());
+    assert!(
+        eventually(Duration::from_secs(5), || coolmaster.served() > 0).await,
+        "the worker never connected"
+    );
+    // Counted from the first connection (the cap stops a loop at SPIN_CAP).
+    let window = Duration::from_millis(1500);
+    tokio::time::sleep(window).await;
+    let in_window = coolmaster.served();
+    coolmaster.answer_normally();
+    rig.mailbox.post(SetUnitPower(UNIT.to_owned(), false));
+    let next = eventually(Duration::from_secs(3), || {
+        received(&coolmaster, "off L1.001") > 0
+    })
+    .await;
+    drop(rig);
+    // One connection per RETRY at most: the first and 5 more in the window, and a margin.
+    assert!(
+        in_window <= 7,
+        "the worker reconnected {in_window} times in {window:?} to a Coolmaster that closed on every command — \
+         at once each time, not at its {RETRY:?} retry pace"
+    );
+    assert!(
+        next,
+        "the Coolmaster answered again, but the state posted was never applied"
+    );
+}
+
+/// An outage's error is published on the first failed attempt, and again only if it changes —
+/// not on every retry for as long as the Coolmaster is away.
+#[tokio::test]
+async fn a_coolmaster_outage_publishes_its_error_once_while_it_does_not_change() {
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.set_up(false);
+    let timing = DeviceTiming {
+        retry: Duration::from_millis(30),
+        warn_after: Duration::from_secs(30),
+    };
+    let rig = Rig::start(coolmaster.address.clone(), timing);
+    // Some twenty attempts.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let reports: Vec<String> = rig
+        .published()
+        .into_iter()
+        .filter(|p| p.starts_with("Error") && p.contains("Connection closed by remote"))
+        .collect();
+    drop(rig);
+    assert!(
+        reports.len() == 1,
+        "an outage whose error did not change published it {} times, once per retry: {reports:#?}",
+        reports.len()
+    );
+}
+
+/// A command the Coolmaster refuses (an unknown unit, say) is someone's to fix: one WARN of its
+/// own kind, `command_rejected` — not `external_failure`, the broker outage's — and the connection
+/// stays, serving the next command.
+#[tokio::test]
+async fn a_command_the_coolmaster_rejects_is_one_warn_command_rejected_and_the_connection_stays() {
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.cap_connections(SPIN_CAP);
+    coolmaster.answer("on ", Answer::Rejected);
+    let log = Capture::start();
+    let rig = Rig::start(coolmaster.address.clone(), paced());
+    assert!(
+        eventually(Duration::from_secs(5), || received(&coolmaster, "ls2") > 0).await,
+        "the worker never connected and listed the units"
+    );
+    rig.mailbox.post(SetUnitPower(UNIT.to_owned(), true));
+    rig.mailbox
+        .post(SetTargetTemperature(UNIT.to_owned(), 22.0));
+    let next = eventually(Duration::from_secs(3), || {
+        received(&coolmaster, "temp L1.001 22") > 0
+    })
+    .await;
+    let served = coolmaster.served();
+    drop(rig);
+    let warnings = log.at_least(tracing::Level::WARN);
+    assert!(
+        warnings.len() == 1 && warnings[0].kind == "command_rejected",
+        "the rejected command was not one WARN `command_rejected`; the log: {:#?}",
+        log.records()
+    );
+    assert!(
+        next && served == 1,
+        "after a rejected command the connection should stay and serve the next one ({served} connections; the next \
+         command {} the Coolmaster)",
+        if next { "reached" } else { "never reached" }
     );
 }
