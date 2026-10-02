@@ -493,9 +493,9 @@ guard       = "runtime_shutdown_bounded"
 name        = "a_stop_does_not_end_a_stalled_start"
 file        = "src/main.rs"
 anchor      = '''                started = starting => started,
-                signal = signals.next() => {'''
+                _ = signals.next() => {'''
 replacement = '''                started = starting => started,
-                signal = std::future::pending::<&'static str>() => {'''
+                _ = std::future::pending::<&'static str>() => {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "stalled"]
 expect_text = "did not stop cleanly within its bound on SIGTERM while its logging start was stalled"
