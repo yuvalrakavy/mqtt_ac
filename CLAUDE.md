@@ -34,6 +34,10 @@ cargo fmt
 The `#[ignore]`d tests in `coolmaster.rs` and `ac_unit.rs` talk to the real Coolmaster (10.0.1.70):
 run them by hand only, never in a gate. `--mqtt` takes `host` or `host:port` (default 1883).
 
+Debug builds have one test seam: `MQTT_AC_TEST_LOGGING_GATE` names a file the logging start reads
+first (`main.rs`, `hold_for_test`), so `tests/signals.rs` can hold the start on a FIFO it holds open.
+Unset, it does nothing; release builds (the deployed one) compile it out.
+
 Every wait carries a `// WAIT: <row>` tag naming a row of `docs/wait-registry.md`, which
 `tests/wait_registry.rs` checks (Store's no-hang spec §13.3, §14). Negative controls for the
 no-hang tests: `docs/no-hang-3b-controls.toml`, run with Store's `scripts/negative-control.py`.

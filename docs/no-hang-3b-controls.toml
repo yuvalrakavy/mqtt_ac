@@ -21,7 +21,9 @@
 # nobody drains the bridge never subscribed (its own logging summary blocked the start), and
 # SIGTERM could not end it; a ResetFilter posted before the first connect was queued and applied
 # (["ls2", "filt L1.001", "on L1.001"]); with SIGTERM sent 3 s in, the stalled-start test let a
-# dropped runtime pass, its deadline counted from the signal.)
+# dropped runtime pass, its deadline counted from the signal. Its replacement holds the logging
+# start through the debug build's seam, `MQTT_AC_TEST_LOGGING_GATE`, until the bridge has exited:
+# a regression never exits, whatever the timing.)
 #
 # The stand-in Coolmaster serves at most a few connections in the reconnect-loop tests, so a
 # mutant that spins is caught after a dozen connections, not thousands: uncapped, one spun 16,282
@@ -474,21 +476,19 @@ expect_text = "a worker died, and the bridge went on without it"
 guard       = "dead_worker_ends_the_bridge"
 
 # Round 3 (C6, F1): the runtime dropped at the end of `main`, as `#[tokio::main]` does: it waits
-# for the blocking thread still in the stalled logging start — since tracing-init 97eebba, until
-# that start gives up on the file (5 s), so about 4 s after SIGTERM instead of within the grace.
+# for the blocking thread still in the held logging start, for as long as the test holds it.
 [[control]]
 name        = "the_runtime_is_dropped"
 file        = "src/main.rs"
 anchor      = '''    runtime.shutdown_timeout(RUNTIME_GRACE);'''
 replacement = '''    drop(runtime);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "stalled"]
-expect_text = "did not stop cleanly within its bound on SIGTERM while its logging start was stalled"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "held_logging_start"]
+expect_text = "did not stop cleanly within its bound on SIGTERM while its logging start was held"
 guard       = "runtime_shutdown_bounded"
 
-# Round 3 (F1, F3): a stop does not end a stalled logging start; the signals are taken, so SIGTERM
-# no longer kills the process, and the bridge waits out the start (5 s since tracing-init 97eebba)
-# before it stops.
+# Round 3 (F1, F3): a stop does not end a held logging start; the signals are taken, so SIGTERM
+# no longer kills the process, and the bridge never gets past the start.
 [[control]]
 name        = "a_stop_does_not_end_a_stalled_start"
 file        = "src/main.rs"
@@ -497,8 +497,8 @@ anchor      = '''                started = starting => started,
 replacement = '''                started = starting => started,
                 _ = std::future::pending::<&'static str>() => {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "stalled"]
-expect_text = "did not stop cleanly within its bound on SIGTERM while its logging start was stalled"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "held_logging_start"]
+expect_text = "did not stop cleanly within its bound on SIGTERM while its logging start was held"
 guard       = "stop_ends_a_stalled_start"
 
 # Round 3 (C8): the catch-up's state in flight when its connection fails is not put back.
@@ -537,7 +537,7 @@ expect_text = "the error queue grew past its cap"
 guard       = "error_queue_capped"
 
 # Round 3 (F3): the logging starts first, on this thread, before the stop signals are taken, as it
-# did: SIGTERM during the stalled start kills the bridge (signal 15).
+# did: SIGTERM during the held start kills the bridge (signal 15).
 [[control]]
 name        = "the_signals_are_taken_after_the_logging"
 file        = "src/main.rs"
@@ -545,8 +545,8 @@ anchor      = '''    let mut signals = StopSignals::register();'''
 replacement = '''    let _logging_first = start_logging();
     let mut signals = StopSignals::register();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "stalled"]
-expect_text = "did not stop cleanly within its bound on SIGTERM while its logging start was stalled: signal: 15"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "held_logging_start"]
+expect_text = "did not stop cleanly within its bound on SIGTERM while its logging start was held: signal: 15"
 guard       = "signals_before_logging"
 
 # Round 4 (B2): the bridge prints its logging summary to stdout itself, as it did: with a stdout

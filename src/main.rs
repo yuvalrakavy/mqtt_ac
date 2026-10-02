@@ -128,6 +128,7 @@ async fn run(config: ServiceConfig) -> ExitCode {
 /// written to stderr directly: there is no log to say it in, and a stderr nobody drains holds only
 /// this thread — the start, which a stop ends regardless — never the bridge's stop.
 fn start_logging() -> Option<TracingGuard> {
+    hold_for_test();
     let started = tracing_init::TracingInit::builder("mqtt_ac")
         .log_to_file(true)
         .log_to_gelf_server(true)
@@ -145,6 +146,21 @@ fn start_logging() -> Option<TracingGuard> {
         }
     }
 }
+
+/// The test seam for a logging start that does not end (debug builds only; the deployed release
+/// build has none): when `MQTT_AC_TEST_LOGGING_GATE` names a file, the start reads it first. A test
+/// points it at a FIFO whose write end it holds open and never writes, so the read — and the start —
+/// never returns until the test lets go, as on a stalled file system; tracing-init's own reads and
+/// opens give up by themselves (5 s), or skip what is not a regular file. Unset, it does nothing.
+#[cfg(debug_assertions)]
+fn hold_for_test() {
+    if let Some(gate) = std::env::var_os("MQTT_AC_TEST_LOGGING_GATE") {
+        let _ = std::fs::read(gate);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_for_test() {}
 
 /// How the bridge ended.
 #[derive(Debug, PartialEq, Eq)]
