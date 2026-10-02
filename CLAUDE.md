@@ -41,21 +41,24 @@ no-hang tests: `docs/no-hang-3b-controls.toml`, run with Store's `scripts/negati
 ## Architecture
 
 Three async worker tasks. Commands for the Coolmaster go through its mailbox, which never waits;
-everything for MQTT through the publisher's bounded `async-channel` queue (capacity 10):
+what the Coolmaster worker reports goes through `Reports`, which never waits either; the session's
+errors go through the publisher's bounded `async-channel` queue (capacity 10):
 
 ```
 Polling Worker ──→ Mailbox (post never waits) ──→ Coolmaster Worker ←──→ TCP (port 10102)
 MQTT Subscriber ──↗                                        │
-      ↑                                             ToMqttPublisherMessage channel
-  Pump (polls rumqttc; unbounded queue)                     ↓
-      ↑                                             MQTT Publisher ──→ MQTT Broker
-  MQTT Broker
+      ↑     └── errors: ToMqttPublisherMessage ──┐   Reports (never waits: the retained
+  Pump (polls rumqttc; unbounded queue)          │            model, and capped errors)
+      ↑                                          ↓          ↓
+  MQTT Broker  ←─────────────────────────── MQTT Publisher
 ```
 
 **Workers** (spawned in `service.rs` via `tokio::task::JoinSet`):
-- **Coolmaster Worker** (`coolmaster.rs`): TCP connection to Coolmaster controller. Takes commands from the mailbox only while connected, executes them, sends results back. Auto-reconnects on failure (5s retry, and never sooner than 5s after its last connect); on each reconnect it applies the state set while it was down, then lists every unit and publishes its observed state. Only a failed *connection* is a reconnect: a command the Coolmaster refuses (WARN `command_rejected`) or answers with something unusable is reported on the error topic and passed over on the same connection, never retried. While the Coolmaster is unreachable its error is published on the first attempt and then only when it changes.
-- **MQTT Worker** (`service.rs`): Manages MQTT connection lifecycle: a session after another (10s retry), each with a fresh client, its publisher half and its subscriber half. The publisher (and the retained state it knows) and the broker's outage state outlive the sessions.
+- **Coolmaster Worker** (`coolmaster.rs`): TCP connection to Coolmaster controller. Takes commands from the mailbox only while connected, executes them (each exchange — a connect and its prompt, a command and its reply — under one 10 s deadline), and hands what it observes to `Reports`, never waiting on MQTT: a stalled broker holds up none of its work. Auto-reconnects on failure (5s retry, and never sooner than 5s after its last connect); on each reconnect it applies the state held while it was down — taken from the mailbox one at a time, so a value set meanwhile replaces its held one — then lists every unit and publishes its observed state. The Coolmaster flag (`Aircondition/Coolmaster/{controller}`) says `true` only once that catch-up has had answers, and `false` as soon as a connection is found gone. Only a failed *connection* is a reconnect: a command the Coolmaster refuses (WARN `command_rejected`) or answers with something unusable is reported on the error topic and passed over on the same connection, never retried. While the Coolmaster is unreachable its error is published on the first attempt and then only when it changes.
+- **MQTT Worker** (`service.rs`): Manages MQTT connection lifecycle: a session after another (10s retry), each with a fresh client, its publisher half and its subscriber half. The publisher, `Reports` (the retained model: the Coolmaster flag and every unit's latest state) and the broker's outage state outlive the sessions; after every CONNACK the publisher publishes the whole model again.
 - **Polling Worker** (`polling.rs`): Posts `PublishUnitsState` every N seconds (default 4s).
+
+None of the workers ends on its own: one that does (a panic, an early return) ends the bridge with ERROR `worker_died` and a failure status, for systemd (`Restart=always`) to restart it.
 
 **Commands while the Coolmaster is down** (the owner's device-down policy, 2026-10-02; `mailbox.rs`):
 the four `Set*` are **states**, kept per unit and property (a newer value replaces the waiting one
@@ -78,14 +81,19 @@ it posts commands to the Coolmaster's mailbox, never waiting on the Coolmaster. 
 forwards to can stop it polling. The pump also clears a rumqttc 0.25 packet-id collision left
 standing by a failed poll, which would otherwise stop the event loop taking requests for good. A
 broker outage is one episode however many sessions it spans: INFO `connection_lost`, one WARN
-`external_failure` past 30 s, INFO `external_recovered` (`down_for_ms`, `attempts`). SIGINT and
-SIGTERM both run the bounded shutdown (5 s; past it, WARN `shutdown_timeout`).
+`external_failure` past 30 s, INFO `external_recovered` (`down_for_ms`, `attempts`) once a
+connection has lasted 5 s — one lost sooner is another failed attempt of the same outage. SIGINT
+and SIGTERM are taken first thing, before the logging starts (on a blocking thread, raced against
+them), and both run the bounded shutdown (5 s; past it, WARN `shutdown_timeout`); `main` then shuts
+the runtime down within 2 s, abandoning any thread still in a synchronous call (a DNS lookup,
+tracing-init's start on a stalled file system) instead of waiting for it.
 
 **Key modules:**
 - `ac_unit.rs` — `UnitState` model and Coolmaster response parsing (power, temp, fan speed, mode)
 - `messages.rs` — `ToCoolmasterMessage` and `ToMqttPublisherMessage` enums for inter-worker IPC
 - `mailbox.rs` — the Coolmaster's `Mailbox`: posts never wait; states, momentary commands and reads classified per the device-down policy
-- `mqtt_publisher.rs` — Publishes state changes as JSON; deduplicates (only publishes when state differs)
+- `reports.rs` — `Reports`: what the Coolmaster worker reports, handed over without waiting — the retained model (coalesced; a state is published only when it changed) and errors (at most 64 waiting; past it the oldest go, WARN `error_report_dropped` once per episode)
+- `mqtt_publisher.rs` — Publishes `Reports`' changes and the session's errors as JSON; the whole model again after every CONNACK
 - `mqtt_subscriber.rs` — The MQTT session: receives JSON commands from `Aircondition/Command/{name}` topic (via the pump), announces on every CONNACK
 - `mqtt_pump.rs` — `Pump`: polls rumqttc's event loop in a task of its own; the forward queue's high-water flag (`Backlog`)
 - `error.rs` — `CoolmasterError` and `MqttError` types using `error-stack`
@@ -100,7 +108,7 @@ SIGTERM both run the bounded shutdown (5 s; past it, WARN `shutdown_timeout`).
 ## Design Patterns
 
 - **Type-state pattern**: `Service<Stopped>` / `Service<Started>` using phantom types
-- **Message passing**: inter-worker communication goes through the Coolmaster's mailbox and the publisher's channel; no other shared mutable state
+- **Message passing**: inter-worker communication goes through the Coolmaster's mailbox, `Reports` and the publisher's channel; no other shared mutable state
 - **Coolmaster protocol**: TCP text protocol — send command + `\r`, read until `>` prompt, parse `OK` / `ERROR` status line
 
 ## Logging
@@ -114,12 +122,13 @@ Log levels follow the fleet policy at `~/Documents/Projects/Store/docs/guides/lo
 
 External outages (MQTT broker unreachable, Coolmaster unreachable) are each one episode: an INFO when it starts, retries at DEBUG, one WARN once it has lasted 30 s, an INFO with its length when it ends (kinds above). Orderly shutdown of channels is INFO (not WARN/ERROR).
 
-Kinds this bridge emits: broker — `connection_lost` (INFO), `external_failure` (WARN, the broker outage only), `external_recovered` (INFO); Coolmaster — `device_connection_lost` (INFO), `device_unreachable` (WARN), `device_recovered` (INFO), `command_refused` (INFO, a momentary command while the Coolmaster is down), `command_rejected` (WARN, a command the Coolmaster refused: fix the unit id or the config); MQTT queue — `mqtt_backlog_high` (WARN), `mqtt_backlog_drained` (INFO), `mqtt_commands_discarded` (WARN); `validation_rejected` (INFO, a malformed command payload); `shutdown_timeout` (WARN); `signal_handler_unavailable` (WARN).
+Kinds this bridge emits: broker — `connection_lost` (INFO), `external_failure` (WARN, the broker outage only), `external_recovered` (INFO); Coolmaster — `device_connection_lost` (INFO), `device_unreachable` (WARN), `device_recovered` (INFO), `command_refused` (INFO, a momentary command while the Coolmaster is down), `command_rejected` (WARN, a command the Coolmaster refused: fix the unit id or the config); MQTT queue — `mqtt_backlog_high` (WARN), `mqtt_backlog_drained` (INFO), `mqtt_commands_discarded` (WARN); the worker's error reports — `error_report_dropped` (WARN, older ones displaced while MQTT takes none) and `error_report_drop_ended` (INFO, `dropped`, `lasted_ms`); `validation_rejected` (INFO, a malformed command payload); `worker_died` (ERROR, a worker ended: the bridge ends); `shutdown_timeout` (WARN); `signal_handler_unavailable` (WARN).
 
 ## Not done (deliberately, for later)
 
 - **The error topic is retained** (`Aircondition/Error/{controller}` is published with retain), though the house topic rules never retain `Error`. It changes with the topic-grammar migration of this bridge and its SDL driver, together.
 - **No explicit `Active=false` or DISCONNECT at shutdown.** The bounded shutdown aborts the workers, and the connection closes without a DISCONNECT, so the broker publishes the last will (`Active=false`, retained). A clean DISCONNECT would suppress the will and need an explicit `Active=false` publish first.
+- **A log file that stops taking writes stalls the bridge.** tracing-init writes its file log synchronously on whatever thread logs (its non-blocking writer is a TODO there), so once the file is open, a stalled file system holds the next log line — on a worker, or in the shutdown itself — and no bound in this bridge covers it. The start is covered: opening the file runs off the workers and a stop ends it. The fix belongs in tracing-init.
 
 This bridge joins distributed traces via MQTT v5 `traceparent` user properties:
 - **Inbound**: `traceparent` user property extracted from each Publish packet; span created with `tracing_init::traceparent::set_remote_parent` before entering

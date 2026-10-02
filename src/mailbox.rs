@@ -19,6 +19,11 @@
 //!
 //! So the mailbox holds at most one state per unit and property, one read per unit and one for
 //! all of them, and `MOMENTARY_CAP` momentary commands.
+//!
+//! The states kept while the Coolmaster was down are **held**: when it is back the worker takes
+//! them first, one at a time (`take_held`), and they stay in the mailbox until then — so a value
+//! set meanwhile replaces its held one, which is never sent (re-review C3). Taken out all at once,
+//! a held value already superseded was applied anyway, however long the catch-up took.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -67,16 +72,6 @@ impl fmt::Display for Refusal {
 /// The text published on the error topic for a refused command.
 pub fn refusal_text(command: &ToCoolmasterMessage, why: Refusal) -> String {
     format!("{command:?} refused: {why}")
-}
-
-/// What the worker takes back when the Coolmaster is connected again.
-#[derive(Debug, Default)]
-pub struct Reconnected {
-    /// The state set while it was down: the latest value per unit and property, in the order last
-    /// set. Taken out of the mailbox, for the worker to apply before anything posted since.
-    pub pending: Vec<ToCoolmasterMessage>,
-    /// Momentary commands refused since it went down.
-    pub refused: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,10 +136,15 @@ struct State {
 struct Entry {
     key: Option<Key>,
     command: ToCoolmasterMessage,
+    /// A state kept while the Coolmaster was down, for the worker to take first when it is back.
+    /// The held entries are always at the front: everything posted while it is connected goes
+    /// behind them.
+    held: bool,
 }
 
 impl State {
-    /// Replace a waiting command with the same key, and move it to the back.
+    /// Replace a waiting command with the same key, and move it to the back — held if the
+    /// Coolmaster is down.
     fn replace(&mut self, key: Key, command: ToCoolmasterMessage) {
         if let Some(i) = self
             .pending
@@ -153,9 +153,11 @@ impl State {
         {
             self.pending.remove(i);
         }
+        let held = !self.connected;
         self.pending.push_back(Entry {
             key: Some(key),
             command,
+            held,
         });
     }
 
@@ -230,6 +232,7 @@ impl Mailbox {
                             state.pending.push_back(Entry {
                                 key: None,
                                 command: command.clone(),
+                                held: false,
                             });
                             Posted::Queued
                         }
@@ -251,20 +254,29 @@ impl Mailbox {
         posted
     }
 
-    /// The Coolmaster is connected: posts are queued for it again, and the state set while it was
-    /// down is handed back (none, if it was never down).
-    pub fn connected(&self) -> Reconnected {
+    /// The Coolmaster is connected: posts are queued for it again, behind the state held while it
+    /// was down, which the worker takes first (`take_held`). Returns how many momentary commands
+    /// were refused while it was down (none, if it was never down).
+    pub fn connected(&self) -> u32 {
         // WAIT: coolmaster-mailbox-lock
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.connected {
-            return Reconnected::default();
+            return 0;
         }
         state.connected = true;
         state.refusal_logged = false;
-        // While it is down only states wait (reads are dropped, momentary commands refused).
-        Reconnected {
-            pending: state.pending.drain(..).map(|e| e.command).collect(),
-            refused: std::mem::take(&mut state.refused),
+        std::mem::take(&mut state.refused)
+    }
+
+    /// The next held state — the oldest kept while the Coolmaster was down and not replaced since
+    /// — or `None` when none is left. Never waits.
+    pub fn take_held(&self) -> Option<ToCoolmasterMessage> {
+        // WAIT: coolmaster-mailbox-lock
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.pending.front().is_some_and(|e| e.held) {
+            state.pending.pop_front().map(|e| e.command)
+        } else {
+            None
         }
     }
 
@@ -286,7 +298,7 @@ impl Mailbox {
             let waiting = std::mem::take(&mut state.pending);
             for entry in waiting {
                 match entry.key {
-                    Some(Key::State(..)) => state.pending.push_back(entry),
+                    Some(Key::State(..)) => state.pending.push_back(Entry { held: true, ..entry }),
                     Some(Key::Read(_)) => {}
                     None => refused.push(entry.command),
                 }
@@ -304,8 +316,8 @@ impl Mailbox {
     }
 
     /// States the worker took but could not apply, the connection having failed: back at the
-    /// front, in order, unless a newer value for the same unit and property is already waiting.
-    /// Anything else is not put back.
+    /// front, in order, held for the next connection, unless a newer value for the same unit and
+    /// property is already waiting. Anything else is not put back.
     pub fn restore(&self, commands: Vec<ToCoolmasterMessage>) {
         // WAIT: coolmaster-mailbox-lock
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -315,6 +327,7 @@ impl Mailbox {
                     state.pending.push_front(Entry {
                         key: Some(key),
                         command,
+                        held: true,
                     });
                 }
             }

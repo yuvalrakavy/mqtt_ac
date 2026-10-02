@@ -1,9 +1,11 @@
 use async_channel::{Receiver, Sender};
 use rumqttc::v5::{AsyncClient, EventLoop, MqttOptions, mqttbytes::QoS, mqttbytes::v5::LastWill};
+use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tokio::{task::JoinSet, time::Duration};
+use tokio::task::{Id, JoinSet};
+use tokio::time::Duration;
 use tracing::{debug, info};
 
 use crate::{
@@ -13,6 +15,7 @@ use crate::{
     mqtt_publisher::MqttPublisher,
     mqtt_pump::BrokerOutage,
     mqtt_subscriber, polling,
+    reports::Reports,
 };
 
 pub struct Started {}
@@ -55,7 +58,23 @@ pub struct Service<Status = Stopped> {
     config: ServiceConfig,
 
     workers: JoinSet<()>,
+    /// Each worker's name, by its task id: a worker that ends is named in the log.
+    names: Vec<(Id, &'static str)>,
     _status: PhantomData<Status>,
+}
+
+impl<Status> Service<Status> {
+    fn spawn(&mut self, name: &'static str, worker: impl Future<Output = ()> + Send + 'static) {
+        let handle = self.workers.spawn(worker);
+        self.names.push((handle.id(), name));
+    }
+
+    fn name(&self, id: Id) -> &'static str {
+        self.names
+            .iter()
+            .find(|(worker, _)| *worker == id)
+            .map_or("unknown", |(_, name)| name)
+    }
 }
 
 impl Service {
@@ -63,6 +82,7 @@ impl Service {
         Service {
             config,
             workers: JoinSet::new(),
+            names: Vec::new(),
             _status: PhantomData,
         }
     }
@@ -125,11 +145,12 @@ impl Service {
         controller_name: &str,
         timing: Timing,
         mailbox: Arc<Mailbox>,
+        reports: Arc<Reports>,
         to_mqtt_publisher_rx: Receiver<ToMqttPublisherMessage>,
         to_mqtt_publisher_tx: Sender<ToMqttPublisherMessage>,
     ) {
         let outage = Arc::new(BrokerOutage::new(timing.broker_warn_after));
-        let mut publisher = MqttPublisher::new(controller_name.to_owned(), to_mqtt_publisher_rx);
+        let mut publisher = MqttPublisher::new(controller_name.to_owned(), reports, to_mqtt_publisher_rx);
         loop {
             debug!("Starting MQTT session");
             Service::mqtt_session(
@@ -152,62 +173,76 @@ impl Service {
 impl Service<Stopped> {
     /// Spawns the workers on the current runtime; it waits on nothing.
     pub fn start(mut self) -> Service<Started> {
-        // The Coolmaster's commands, posted without waiting; the publisher's queue.
+        // The Coolmaster's commands, posted without waiting; its reports, handed over without
+        // waiting; the session's errors, queued for the publisher.
         let mailbox = Mailbox::new();
+        let reports = Reports::new();
         let (to_mqtt_publisher_tx, to_mqtt_publisher_rx) = async_channel::bounded(10);
         let timing = self.config.timing;
 
-        // Create coolmaster worker
-
         let coolmaster_address = self.config.coolmaster_address.clone();
-        let to_mqtt_publisher_tx_instance = to_mqtt_publisher_tx.clone();
         let device_timing = DeviceTiming {
             retry: timing.device_retry,
             warn_after: timing.device_warn_after,
         };
-        let worker_mailbox = mailbox.clone();
-        self.workers.spawn(async move {
-            Coolmaster::coolmaster_worker(
-                &coolmaster_address,
-                worker_mailbox,
-                to_mqtt_publisher_tx_instance,
-                device_timing,
-            )
-            .await;
+        let (worker_mailbox, worker_reports) = (mailbox.clone(), reports.clone());
+        self.spawn("coolmaster", async move {
+            Coolmaster::coolmaster_worker(&coolmaster_address, worker_mailbox, worker_reports, device_timing).await;
         });
 
-        // Create mqtt publisher worker
         let controller_name = self.config.controller_name.clone();
         let mqtt_broker = self.config.mqtt_broker_address.clone();
         let mqtt_mailbox = mailbox.clone();
-
-        self.workers.spawn(async move {
+        self.spawn("mqtt", async move {
             Self::mqtt_worker(
                 &mqtt_broker,
                 &controller_name,
                 timing,
                 mqtt_mailbox,
+                reports,
                 to_mqtt_publisher_rx,
                 to_mqtt_publisher_tx,
             )
             .await
         });
 
-        // Create polling worker
-        self.workers.spawn(async move {
-            polling::polling_worker(self.config.polling_period, mailbox).await;
+        let polling_period = self.config.polling_period;
+        self.spawn("polling", async move {
+            polling::polling_worker(polling_period, mailbox).await;
         });
 
         info!("Service started");
         Service {
             config: self.config,
             workers: self.workers,
+            names: self.names,
             _status: PhantomData,
         }
     }
 }
 
 impl Service<Started> {
+    /// The first worker to end, by name, and how: none of them ends on its own, so a panic or an
+    /// early return is the end of the bridge (re-review C5). Cancellation-safe.
+    pub async fn worker_ended(&mut self) -> (&'static str, String) {
+        // WAIT: worker-join
+        match self.workers.join_next_with_id().await {
+            Some(Ok((id, ()))) => (self.name(id), "returned".to_owned()),
+            Some(Err(error)) => (self.name(error.id()), error.to_string()),
+            None => {
+                // No worker at all: nothing can end.
+                // WAIT: worker-join
+                std::future::pending::<(&'static str, String)>().await
+            }
+        }
+    }
+
+    /// A worker of the test's own, among the service's.
+    #[cfg(test)]
+    pub fn spawn_worker(&mut self, name: &'static str, task: impl Future<Output = ()> + Send + 'static) {
+        self.spawn(name, task);
+    }
+
     pub async fn stop(mut self) -> Service<Stopped> {
         // WAIT: task-shutdown
         self.workers.shutdown().await;
@@ -216,6 +251,7 @@ impl Service<Started> {
         Service {
             config: self.config,
             workers: self.workers,
+            names: self.names,
             _status: PhantomData,
         }
     }

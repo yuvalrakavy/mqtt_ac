@@ -109,3 +109,59 @@ async fn sigterm_stops_the_bridge_cleanly() {
 async fn sigint_stops_the_bridge_cleanly() {
     stops_cleanly_on("-INT", "sigint").await;
 }
+
+/// The whole process stops within its bound, whatever a blocking thread is doing (re-review C6,
+/// the fleet's F1 and F3). The bridge's file-system work is tracing-init's: it reads its logging
+/// configuration and opens today's log file, synchronously. Here that log file is a FIFO nobody
+/// reads, so opening it for writing never returns — as on a stalled file system. SIGTERM must
+/// still stop the bridge, cleanly and promptly: the stop signals are taken before anything else,
+/// the logging starts off the runtime's workers, and the runtime is shut down with a bound instead
+/// of dropped (dropping it waits for every blocking thread: here for good, and for a DNS lookup of
+/// the broker's or the Coolmaster's name as long as the resolver takes). With the signals taken
+/// after the logging start, SIGTERM kills the stalled bridge instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_during_a_stalled_logging_start_stops_the_bridge_within_its_bound() {
+    let broker = FakeBroker::start().await;
+    let dir = workdir("stalled_start");
+    // tracing-appender's daily file: `{prefix}.{UTC date}.{suffix}`, in the bridge's `logs`.
+    let today = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%d"])
+        .output()
+        .expect("today's UTC date");
+    let today = String::from_utf8_lossy(&today.stdout).trim().to_owned();
+    std::fs::create_dir_all(dir.join("logs")).expect("the log directory");
+    let fifo = dir.join("logs").join(format!("ac.{today}.log"));
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.is_ok_and(|s| s.success()), "could not make the FIFO");
+    let mut bridge = tokio::process::Command::new(env!("CARGO_BIN_EXE_mqtt_ac"))
+        .args([NAME, broker.address().as_str(), refused_address().as_str()])
+        .current_dir(&dir)
+        .env("LOG_CONFIG", dir.join("logging.toml"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the bridge");
+
+    // Time to start and reach the read that never returns.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let pid = bridge.id().expect("the bridge's pid").to_string();
+    let sent = std::process::Command::new("kill").args(["-TERM", &pid]).status();
+    assert!(sent.is_ok_and(|s| s.success()), "could not send SIGTERM to the bridge");
+
+    let started = std::time::Instant::now();
+    let status = match tokio::time::timeout(Duration::from_secs(15), bridge.wait()).await {
+        Ok(status) => status.expect("the bridge's exit status"),
+        Err(_) => {
+            let _ = bridge.start_kill();
+            panic!("the bridge did not exit within 15 s of SIGTERM while its logging start was stalled");
+        }
+    };
+    let took = started.elapsed();
+    assert!(
+        status.success() && took < Duration::from_secs(10),
+        "the bridge did not stop cleanly within its bound on SIGTERM while its logging start was stalled: {status} \
+         after {took:?}"
+    );
+}

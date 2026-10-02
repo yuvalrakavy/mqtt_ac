@@ -25,6 +25,11 @@ fn down() -> std::sync::Arc<Mailbox> {
     mailbox
 }
 
+/// Every held state, taken as the worker's catch-up takes them.
+fn held(mailbox: &Mailbox) -> Vec<ToCoolmasterMessage> {
+    std::iter::from_fn(|| mailbox.take_held()).collect()
+}
+
 #[test]
 fn state_set_while_down_keeps_the_latest_value_per_unit_and_property_in_the_order_last_set() {
     let mailbox = down();
@@ -38,9 +43,9 @@ fn state_set_while_down_keeps_the_latest_value_per_unit_and_property_in_the_orde
     ] {
         assert_eq!(mailbox.post(command), Posted::Queued);
     }
-    let back = mailbox.connected();
+    assert_eq!(mailbox.connected(), 0);
     assert_eq!(
-        back.pending,
+        held(&mailbox),
         [
             power(U2, true),
             SetUnitMode(U2.to_owned(), OperationMode::Heat),
@@ -51,8 +56,27 @@ fn state_set_while_down_keeps_the_latest_value_per_unit_and_property_in_the_orde
     );
     assert!(
         mailbox.waiting().is_empty(),
-        "the pending state was handed back and also left waiting"
+        "the held state was taken and also left waiting"
     );
+}
+
+/// The held state stays in the mailbox until the worker takes it, so a value posted once the
+/// Coolmaster is back replaces its held one, and goes behind the rest of the held state (C3).
+#[test]
+fn a_value_posted_after_the_return_replaces_its_held_one() {
+    let mailbox = down();
+    mailbox.post(power(U1, true));
+    mailbox.post(temperature(U1, 20.0));
+    mailbox.post(power(U2, true));
+    mailbox.connected();
+    assert_eq!(mailbox.take_held(), Some(power(U1, true)));
+    mailbox.post(temperature(U1, 22.0));
+    assert_eq!(
+        held(&mailbox),
+        [power(U2, true)],
+        "a held value replaced since the Coolmaster came back was still taken as held"
+    );
+    assert_eq!(mailbox.waiting(), [temperature(U1, 22.0)]);
 }
 
 #[test]
@@ -67,7 +91,7 @@ fn a_momentary_command_is_refused_while_the_coolmaster_is_down() {
         "a refused momentary command was kept"
     );
     assert_eq!(
-        mailbox.connected().refused,
+        mailbox.connected(),
         1,
         "the refusal was not counted for the recovery line"
     );
@@ -86,7 +110,8 @@ fn reads_are_dropped_while_down_and_coalesced_while_up() {
         Posted::Dropped
     );
     assert_eq!(mailbox.post(PublishUnitsState), Posted::Dropped);
-    assert!(mailbox.connected().pending.is_empty());
+    assert_eq!(mailbox.connected(), 0);
+    assert!(mailbox.take_held().is_none());
 
     mailbox.post(PublishUnitState(U1.to_owned()));
     mailbox.post(PublishUnitsState);
@@ -133,9 +158,8 @@ fn momentary_commands_waiting_when_the_coolmaster_goes_down_are_refused() {
         [power(U1, true)],
         "only the state should wait for the Coolmaster's return"
     );
-    let back = mailbox.connected();
-    assert_eq!(back.pending, [power(U1, true)]);
-    assert_eq!(back.refused, 1);
+    assert_eq!(mailbox.connected(), 1);
+    assert_eq!(held(&mailbox), [power(U1, true)]);
 }
 
 #[test]
@@ -168,7 +192,7 @@ fn the_first_refusal_of_an_outage_is_logged_at_info_and_the_rest_at_debug() {
         "an outage's refusals were not one INFO then DEBUG; the log: {:#?}",
         log.records()
     );
-    assert_eq!(mailbox.connected().refused, 3);
+    assert_eq!(mailbox.connected(), 3);
     mailbox.disconnected();
     mailbox.post(ResetFilter(U1.to_owned()));
     assert_eq!(
@@ -209,7 +233,7 @@ async fn a_full_momentary_queue_is_said_once_per_episode() {
     );
     mailbox.disconnected();
     assert_eq!(
-        mailbox.connected().refused,
+        mailbox.connected(),
         MOMENTARY_CAP as u32,
         "the recovery line should count the commands refused for the outage (those waiting at the disconnect), not \
          those refused for a full queue"

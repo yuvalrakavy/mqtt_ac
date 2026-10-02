@@ -1,6 +1,6 @@
 use async_channel::Receiver;
 use error_stack::{Report, ResultExt};
-use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::Notify;
 
 use tracing::debug;
@@ -8,36 +8,39 @@ use tracing::debug;
 use crate::ac_unit::UnitState;
 use crate::error::MqttError;
 use crate::messages::ToMqttPublisherMessage;
+use crate::reports::{Changes, Model, Reports};
 use rumqttc::v5::{self, mqttbytes::QoS, mqttbytes::v5::PublishProperties};
 
-/// Publishes what the Coolmaster worker and the session report. It outlives the MQTT sessions —
-/// the MQTT worker keeps it and lends it to each — so it knows the retained state it published
-/// across all of them: a unit's state is published only when it changed, and everything it knows
-/// is published again after every CONNACK, since a reconnect without a session drops whatever
-/// rumqttc still held (rumqttc 0.25, `EventLoop::clean`, then `pending.clear()`).
+/// Publishes what the Coolmaster worker reports and what the session hands it. It outlives the MQTT
+/// sessions — the MQTT worker keeps it and lends it to each. The retained state it publishes is the
+/// worker's model (`Reports`), which the worker updates without waiting: a unit's state is
+/// published when it changed, and the whole model again after every CONNACK, since a reconnect
+/// without a session drops whatever rumqttc still held (rumqttc 0.25, `EventLoop::clean`, then
+/// `pending.clear()`) and a broker that restarted may have lost its retained messages. A publish
+/// cut short by the end of its session loses nothing: the model already holds the report, and the
+/// next session publishes it after its CONNACK (re-review C2).
 pub struct MqttPublisher {
     controller_name: String,
-    unit_states: HashMap<String, UnitState>,
-    coolmaster_connected: Option<bool>,
-    to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
+    reports: Arc<Reports>,
+    session_errors: Receiver<ToMqttPublisherMessage>,
 }
 
 impl MqttPublisher {
     pub fn new(
         controller_name: String,
-        to_mqtt_publisher_channel: Receiver<ToMqttPublisherMessage>,
+        reports: Arc<Reports>,
+        session_errors: Receiver<ToMqttPublisherMessage>,
     ) -> Self {
         MqttPublisher {
             controller_name,
-            unit_states: HashMap::new(),
-            coolmaster_connected: None,
-            to_mqtt_publisher_channel,
+            reports,
+            session_errors,
         }
     }
 
     /// One MQTT session's publishing, on its client. Ends with an error when a publish fails (the
-    /// session's event loop is gone) or the queue closes. `reconnected` is the session's word that
-    /// the broker accepted a connection.
+    /// session's event loop is gone) or the session's queue closes. `reconnected` is the session's
+    /// word that the broker accepted a connection.
     pub async fn session(
         &mut self,
         mqtt_client: &v5::AsyncClient,
@@ -47,66 +50,63 @@ impl MqttPublisher {
 
         loop {
             // WAIT: publisher-messages
-            let message = tokio::select! {
+            tokio::select! {
                 _ = reconnected.notified() => {
-                    self.republish(mqtt_client).await?;
-                    continue;
+                    let model = self.reports.model();
+                    self.republish(mqtt_client, model).await?;
                 }
-                message = self.to_mqtt_publisher_channel.recv() => {
-                    message.change_context_lazy(into_context)?
+                _ = self.reports.reported() => {
+                    let changes = self.reports.take();
+                    self.publish_changes(mqtt_client, changes).await?;
                 }
-            };
-
-            match message {
-                ToMqttPublisherMessage::UnitState(unit_state) => self
-                    .publish_if_modified(mqtt_client, unit_state)
-                    .await
-                    .change_context_lazy(into_context)?,
-
-                ToMqttPublisherMessage::UnitsState(unit_states) => {
-                    for unit_state in unit_states {
-                        self.publish_if_modified(mqtt_client, unit_state)
-                            .await
-                            .change_context_lazy(into_context)?;
-                    }
-                }
-
-                ToMqttPublisherMessage::Error(error_message) => {
-                    let topic = format!("Aircondition/Error/{}", self.controller_name);
-                    debug!(topic = %topic, "Publishing error message");
-                    let payload = serde_json::to_vec(&error_message).unwrap();
-                    // WAIT: mqtt-request
-                    mqtt_client
-                        .publish_with_properties(topic, QoS::AtLeastOnce, true, payload, props())
-                        .await
-                        .map_err(|e| {
-                            MqttError::ApiError(e.to_string(), "Publish error".to_owned())
-                        })?;
-                }
-
-                ToMqttPublisherMessage::CoolmasterConnected(connected) => {
-                    self.coolmaster_connected = Some(connected);
-                    self.publish_coolmaster_connected(mqtt_client, connected)
-                        .await?;
+                message = self.session_errors.recv() => {
+                    let ToMqttPublisherMessage::Error(error) = message.change_context_lazy(into_context)?;
+                    self.publish_error(mqtt_client, error).await?;
                 }
             }
         }
     }
 
     /// After a CONNACK: everything known, again.
-    async fn republish(&self, mqtt_client: &v5::AsyncClient) -> Result<(), Report<MqttError>> {
+    async fn republish(&self, mqtt_client: &v5::AsyncClient, model: Model) -> Result<(), Report<MqttError>> {
         debug!(
-            units = self.unit_states.len(),
+            units = model.units.len(),
             "Publishing the known state again after a reconnect"
         );
-        if let Some(connected) = self.coolmaster_connected {
+        if let Some(connected) = model.connected {
             self.publish_coolmaster_connected(mqtt_client, connected)
                 .await?;
         }
-        for unit_state in self.unit_states.values() {
+        for unit_state in &model.units {
             self.publish_unit_state(mqtt_client, unit_state).await?;
         }
         Ok(())
+    }
+
+    /// What the Coolmaster worker reported since the last take.
+    async fn publish_changes(&self, mqtt_client: &v5::AsyncClient, changes: Changes) -> Result<(), Report<MqttError>> {
+        if let Some(connected) = changes.connected {
+            self.publish_coolmaster_connected(mqtt_client, connected)
+                .await?;
+        }
+        for unit_state in &changes.units {
+            self.publish_unit_state(mqtt_client, unit_state).await?;
+        }
+        for error in changes.errors {
+            self.publish_error(mqtt_client, error).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_error(&self, mqtt_client: &v5::AsyncClient, error: String) -> Result<(), Report<MqttError>> {
+        let topic = format!("Aircondition/Error/{}", self.controller_name);
+        debug!(topic = %topic, "Publishing error message");
+        let payload = serde_json::to_vec(&error).unwrap();
+        // WAIT: mqtt-request
+        mqtt_client
+            .publish_with_properties(topic, QoS::AtLeastOnce, true, payload, props())
+            .await
+            .map_err(|e| MqttError::ApiError(e.to_string(), "Publish error".to_owned()).into())
     }
 
     async fn publish_coolmaster_connected(
@@ -125,18 +125,6 @@ impl MqttPublisher {
                 let context = "Publish coolmaster connected".to_owned();
                 MqttError::ApiError(e.to_string(), context).into()
             })
-    }
-
-    async fn publish_if_modified(
-        &mut self,
-        mqtt_client: &v5::AsyncClient,
-        unit_state: UnitState,
-    ) -> Result<(), Report<MqttError>> {
-        if self.unit_states.get(&unit_state.unit) != Some(&unit_state) {
-            self.publish_unit_state(mqtt_client, &unit_state).await?;
-            self.unit_states.insert(unit_state.unit.clone(), unit_state);
-        }
-        Ok(())
     }
 
     async fn publish_unit_state(
@@ -169,3 +157,6 @@ fn props() -> PublishProperties {
     }
     props
 }
+
+#[cfg(test)]
+mod tests;

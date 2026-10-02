@@ -15,13 +15,24 @@ use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 /// A TCP relay between the bridge and the broker that a test can cut, as a network fault would:
 /// the bridge sees its connection drop, and reconnects through the relay. It can also refuse
-/// connections, as a broker that is down would.
+/// connections, as a broker that is down would, or drop each one a while after it is made, as a
+/// broker that takes connections and loses them does.
+///
+/// It takes at most `RELAY_CAP` connections, refused or not, and then stops listening: a bridge
+/// that reconnects in a loop is refused by the operating system from then on, and leaves no
+/// TIME_WAIT socket behind for each attempt (an uncapped spin used up this host's ephemeral ports).
 pub struct Relay {
     pub address: String,
     links: Arc<Mutex<Vec<JoinHandle<()>>>>,
     refusing: Arc<AtomicBool>,
+    /// Each connection made from now on is dropped this long after it is made (ms; 0: never).
+    drop_after_ms: Arc<AtomicUsize>,
+    accepted: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
+
+/// The connections a relay takes at most (see `Relay`).
+pub const RELAY_CAP: usize = 100;
 
 impl Drop for Relay {
     fn drop(&mut self) {
@@ -38,24 +49,43 @@ impl Relay {
         let held = links.clone();
         let refusing = Arc::new(AtomicBool::new(false));
         let refuse = refusing.clone();
+        let drop_after_ms = Arc::new(AtomicUsize::new(0));
+        let drop_after = drop_after_ms.clone();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut client, _)) = listener.accept().await {
+                if counted.fetch_add(1, Ordering::SeqCst) + 1 >= RELAY_CAP {
+                    return; // the listener is dropped: refused from now on
+                }
                 if refuse.load(Ordering::SeqCst) {
                     drop(client);
                     continue;
                 }
                 let upstream = upstream.clone();
+                let lifetime = match drop_after.load(Ordering::SeqCst) {
+                    0 => None,
+                    ms => Some(std::time::Duration::from_millis(ms as u64)),
+                };
                 let link = tokio::spawn(async move {
                     if let Ok(mut server) = TcpStream::connect(&upstream).await {
                         let _ = server.set_nodelay(true);
                         let _ = client.set_nodelay(true);
-                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                        let relayed = tokio::io::copy_bidirectional(&mut client, &mut server);
+                        match lifetime {
+                            Some(lifetime) => {
+                                let _ = tokio::time::timeout(lifetime, relayed).await;
+                            }
+                            None => {
+                                let _ = relayed.await;
+                            }
+                        }
                     }
                 });
                 held.lock().unwrap().push(link);
             }
         });
-        Relay { address, links, refusing, task }
+        Relay { address, links, refusing, drop_after_ms, accepted, task }
     }
 
     /// Drop every open connection through the relay.
@@ -68,6 +98,18 @@ impl Relay {
     /// Refuse every new connection from now on (a broker that is down), or take them again.
     pub fn refuse(&self, refusing: bool) {
         self.refusing.store(refusing, Ordering::SeqCst);
+    }
+
+    /// Drop each connection made from now on `after` it is made (a broker that takes connections
+    /// and loses them), or (`None`) keep them.
+    pub fn drop_connections_after(&self, after: Option<std::time::Duration>) {
+        let ms = after.map_or(0, |after| after.as_millis().max(1) as usize);
+        self.drop_after_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// How many connections the relay has taken, refused or not.
+    pub fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
     }
 }
 
@@ -98,8 +140,11 @@ pub struct FakeCoolmaster {
 struct CoolmasterShared {
     up: AtomicBool,
     steady: bool,
-    /// Commands answered otherwise, by the prefix they start with; the first match wins.
-    answers: Mutex<Vec<(String, Answer)>>,
+    /// Commands answered otherwise, by the prefix they start with; the first match wins. A rule
+    /// with a count answers that many commands, and is then gone.
+    answers: Mutex<Vec<Rule>>,
+    /// Permits for `Answer::Gated` replies.
+    gate: tokio::sync::Semaphore,
     listings: AtomicUsize,
     /// Connections served (taken while up, under the cap).
     served: AtomicUsize,
@@ -138,6 +183,7 @@ impl FakeCoolmaster {
             up: AtomicBool::new(true),
             steady,
             answers: Mutex::new(Vec::new()),
+            gate: tokio::sync::Semaphore::new(0),
             listings: AtomicUsize::new(0),
             served: AtomicUsize::new(0),
             cap: AtomicUsize::new(CONNECTION_CAP),
@@ -181,7 +227,26 @@ impl FakeCoolmaster {
     /// From now on, answer the commands that start with `prefix` (every one, for `""`) so.
     pub fn answer(&self, prefix: &str, answer: Answer) {
         let mut answers = self.shared.answers.lock().unwrap();
-        answers.push((prefix.to_owned(), answer));
+        answers.push(Rule {
+            prefix: prefix.to_owned(),
+            answer,
+            remaining: None,
+        });
+    }
+
+    /// Answer the next command that starts with `prefix` so, and the ones after it as before.
+    pub fn answer_once(&self, prefix: &str, answer: Answer) {
+        let mut answers = self.shared.answers.lock().unwrap();
+        answers.push(Rule {
+            prefix: prefix.to_owned(),
+            answer,
+            remaining: Some(1),
+        });
+    }
+
+    /// Let one `Answer::Gated` reply go.
+    pub fn open_gate(&self) {
+        self.shared.gate.add_permits(1);
     }
 
     /// From now on, answer every command as a Coolmaster does.
@@ -216,6 +281,31 @@ pub enum Answer {
     Rejected,
     /// No answer: the connection is closed.
     Close,
+    /// The usual answer, once the test lets it go (`open_gate`): the command has been received
+    /// (it is in `commands`) and the bridge is waiting for its reply.
+    Gated,
+}
+
+struct Rule {
+    prefix: String,
+    answer: Answer,
+    remaining: Option<usize>,
+}
+
+/// How to answer `command`: the first rule whose prefix it starts with, counted down.
+fn answer_for(shared: &CoolmasterShared, command: &str) -> Option<Answer> {
+    let mut answers = shared.answers.lock().unwrap();
+    let i = answers
+        .iter()
+        .position(|rule| command.starts_with(rule.prefix.as_str()))?;
+    let answer = answers[i].answer;
+    if let Some(remaining) = &mut answers[i].remaining {
+        *remaining -= 1;
+        if *remaining == 0 {
+            answers.remove(i);
+        }
+    }
+    Some(answer)
 }
 
 async fn serve_coolmaster(stream: TcpStream, shared: Arc<CoolmasterShared>) {
@@ -233,16 +323,18 @@ async fn serve_coolmaster(stream: TcpStream, shared: Arc<CoolmasterShared>) {
         }
         let command = String::from_utf8_lossy(&line).trim().to_owned();
         shared.commands.lock().unwrap().push(command.clone());
-        let answer = {
-            let answers = shared.answers.lock().unwrap();
-            let matches = |(prefix, _): &&(String, Answer)| command.starts_with(prefix.as_str());
-            answers.iter().find(matches).map(|(_, answer)| *answer)
-        };
+        let answer = answer_for(&shared, &command);
+        if let Some(Answer::Gated) = answer {
+            match shared.gate.acquire().await {
+                Ok(permit) => permit.forget(),
+                Err(_) => return,
+            }
+        }
         let reply = match (answer, command.strip_prefix("ls2")) {
             (Some(Answer::Close), _) => return,
             (Some(Answer::Unusable), _) => b"\xff\xfe\r\nOK\r\n>".to_vec(),
             (Some(Answer::Rejected), _) => b"ERROR: 1\r\n>".to_vec(),
-            (None, Some(unit)) => {
+            (None | Some(Answer::Gated), Some(unit)) => {
                 let n = shared.listings.fetch_add(1, Ordering::SeqCst);
                 let room = if shared.steady { 25 } else { 10 + n % 50 };
                 let unit = unit.trim();
@@ -253,7 +345,7 @@ async fn serve_coolmaster(stream: TcpStream, shared: Arc<CoolmasterShared>) {
                     .collect();
                 format!("{}\r\nOK\r\n>", lines.join("\r\n")).into_bytes()
             }
-            (None, None) => b"OK\r\n>".to_vec(),
+            (None | Some(Answer::Gated), None) => b"OK\r\n>".to_vec(),
         };
         if wr.write_all(&reply).await.is_err() {
             return;

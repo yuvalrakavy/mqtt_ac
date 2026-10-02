@@ -7,6 +7,7 @@ use std::time::Duration;
 use super::{Coolmaster, DeviceTiming};
 use crate::mailbox::{Mailbox, Posted, Refusal};
 use crate::messages::ToCoolmasterMessage::{self, *};
+use crate::reports::Reports;
 use crate::test_support::{Answer, Capture, FakeCoolmaster, UNITS};
 
 const UNIT: &str = UNITS[0];
@@ -46,7 +47,8 @@ async fn eventually(within: Duration, mut ready: impl FnMut() -> bool) -> bool {
     true
 }
 
-/// The worker, with a mailbox, and what it hands the publisher (as text).
+/// The worker, with a mailbox, and what it hands the publisher (as text: `CoolmasterConnected(..)`,
+/// `UnitState(..)` for each unit, `Error(..)`), taken as a publisher takes it.
 struct Rig {
     mailbox: Arc<Mailbox>,
     published: Arc<Mutex<Vec<String>>>,
@@ -64,19 +66,30 @@ impl Drop for Rig {
 impl Rig {
     fn start(address: String, timing: DeviceTiming) -> Rig {
         let mailbox = Mailbox::new();
-        let (tx, rx) = async_channel::bounded(10);
+        let reports = Reports::new();
         let published = Arc::new(Mutex::new(Vec::new()));
         let worker = {
-            let mailbox = mailbox.clone();
+            let (mailbox, reports) = (mailbox.clone(), reports.clone());
             tokio::spawn(async move {
-                Coolmaster::coolmaster_worker(&address, mailbox, tx, timing).await;
+                Coolmaster::coolmaster_worker(&address, mailbox, reports, timing).await;
             })
         };
         let reader = {
             let published = published.clone();
             tokio::spawn(async move {
-                while let Ok(message) = rx.recv().await {
-                    published.lock().unwrap().push(format!("{message:?}"));
+                loop {
+                    reports.reported().await;
+                    let changes = reports.take();
+                    let mut published = published.lock().unwrap();
+                    if let Some(connected) = changes.connected {
+                        published.push(format!("CoolmasterConnected({connected})"));
+                    }
+                    for unit in changes.units {
+                        published.push(format!("UnitState({unit:?})"));
+                    }
+                    for error in changes.errors {
+                        published.push(format!("Error({error:?})"));
+                    }
                 }
             })
         };
@@ -167,7 +180,7 @@ async fn a_coolmaster_outage_is_applied_refused_and_logged_as_one_episode() {
         "the momentary command waiting at the drop was refused without an error publish: {published:#?}"
     );
     assert!(
-        published.iter().any(|p| p.starts_with("UnitsState")),
+        published.iter().any(|p| p.starts_with("UnitState")),
         "the units' observed state was not published after the return: {published:#?}"
     );
 
@@ -407,6 +420,92 @@ async fn a_coolmaster_outage_publishes_its_error_once_while_it_does_not_change()
         reports.len() == 1,
         "an outage whose error did not change published it {} times, once per retry: {reports:#?}",
         reports.len()
+    );
+}
+
+/// The worker has found the Coolmaster down and said so on the error topic.
+async fn reported_down(rig: &Rig) -> bool {
+    eventually(Duration::from_secs(5), || {
+        rig.published().iter().any(|p| p.starts_with("Error"))
+    })
+    .await
+}
+
+/// The device-down policy's "latest value per unit and property" holds during the catch-up too
+/// (re-review C3): a value set while the held state is being applied replaces the held one for its
+/// unit and property, which is then never sent. Taken out of the mailbox all at once when the
+/// Coolmaster is back, the held values are applied however long the catch-up takes, and a value
+/// already superseded reaches the Coolmaster — ON then OFF, a setpoint and then another.
+#[tokio::test]
+async fn a_value_set_during_the_catch_up_supersedes_the_held_one() {
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.cap_connections(SPIN_CAP);
+    coolmaster.set_up(false);
+    let rig = Rig::start(coolmaster.address.clone(), paced());
+    assert!(
+        reported_down(&rig).await,
+        "the worker never reported the Coolmaster down"
+    );
+    rig.mailbox.post(SetUnitPower(UNIT.to_owned(), true));
+    rig.mailbox
+        .post(SetTargetTemperature(UNIT.to_owned(), 20.0));
+    // The Coolmaster holds its answer to the first held state until the test lets it go: the
+    // catch-up has begun, and the held setpoint is not applied yet.
+    coolmaster.answer_once("on ", Answer::Gated);
+    coolmaster.set_up(true);
+    assert!(
+        eventually(Duration::from_secs(5), || received(&coolmaster, "on L1.001") == 1).await,
+        "the worker never applied the held power once the Coolmaster was back"
+    );
+    rig.mailbox
+        .post(SetTargetTemperature(UNIT.to_owned(), 22.0));
+    coolmaster.open_gate();
+    let newest = eventually(Duration::from_secs(5), || {
+        received(&coolmaster, "temp L1.001 22") == 1
+    })
+    .await;
+    let commands = coolmaster.commands();
+    drop(rig);
+    assert!(
+        newest,
+        "the setpoint set during the catch-up never reached the Coolmaster: {commands:?}"
+    );
+    assert!(
+        !commands.iter().any(|c| c == "temp L1.001 20"),
+        "a held setpoint superseded during the catch-up was applied anyway, before the newer one: {commands:?}"
+    );
+}
+
+/// The catch-up's connection fails under the first held state (re-review C8): that state, and
+/// every held state after it, wait for the next connection and are applied there, in order. Not
+/// put back, they are lost: the Coolmaster never gets what was set while it was away.
+#[tokio::test]
+async fn a_connection_lost_during_the_catch_up_keeps_every_held_state() {
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.cap_connections(SPIN_CAP);
+    coolmaster.set_up(false);
+    let rig = Rig::start(coolmaster.address.clone(), paced());
+    assert!(
+        reported_down(&rig).await,
+        "the worker never reported the Coolmaster down"
+    );
+    rig.mailbox.post(SetUnitPower(UNIT.to_owned(), true));
+    rig.mailbox
+        .post(SetTargetTemperature(UNIT.to_owned(), 22.0));
+    // Back, but the first command of the catch-up loses the connection.
+    coolmaster.answer_once("on ", Answer::Close);
+    coolmaster.set_up(true);
+    let listed = eventually(Duration::from_secs(5), || received(&coolmaster, "ls2") > 0).await;
+    let commands = coolmaster.commands();
+    drop(rig);
+    assert!(
+        listed,
+        "the worker never listed the units once the Coolmaster answered: {commands:?}"
+    );
+    assert_eq!(
+        commands,
+        ["on L1.001", "on L1.001", "temp L1.001 22", "ls2"],
+        "the held states the failed catch-up had not applied were not all applied on the next connection"
     );
 }
 

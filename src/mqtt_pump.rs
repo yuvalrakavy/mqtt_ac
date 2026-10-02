@@ -113,18 +113,29 @@ impl Backlog {
     }
 }
 
+/// How long a connection made during an outage must last before the outage is over (the fleet's
+/// F2: recovery on proof of life, not on a bare connect). A broker that takes each connection and
+/// loses it — a second instance with the same client id, a broker that drops what it accepts — is
+/// then one outage with its WARN, not an INFO pair per connection. The pump sees an event at least
+/// every keep-alive (5 s), so the end is said within one keep-alive of the window.
+pub const STABLE_AFTER: Duration = Duration::from_secs(5);
+
 /// The broker's reachability as the pumps see it. It outlives every session — the pump gives up
 /// after `MAX_CONSECUTIVE_ERRORS` and the worker starts a new session — so an outage is one
 /// episode however many attempts and sessions it takes (logging policy): an INFO when it starts,
 /// one WARN once it has lasted `warn_after`, the attempts in between at DEBUG, and an INFO with its
-/// length when the broker is back. Atomics only: one pump at a time uses it, and nothing is logged
-/// under a lock.
+/// length once a connection has lasted `STABLE_AFTER` — a connection lost sooner is one more failed
+/// attempt of the same outage. Atomics only: one pump at a time uses it, and nothing is logged under
+/// a lock.
 pub struct BrokerOutage {
     warn_after: Duration,
     epoch: Instant,
     /// When the outage began, in milliseconds since `epoch` plus one; 0 while the broker is
     /// reachable.
     since: AtomicU64,
+    /// When the broker accepted the connection that may end the outage, the same way; 0 when none
+    /// is on trial.
+    connected_at: AtomicU64,
     attempts: AtomicU32,
     warned: AtomicBool,
 }
@@ -135,6 +146,7 @@ impl BrokerOutage {
             warn_after,
             epoch: Instant::now(),
             since: AtomicU64::new(0),
+            connected_at: AtomicU64::new(0),
             attempts: AtomicU32::new(0),
             warned: AtomicBool::new(false),
         }
@@ -144,9 +156,11 @@ impl BrokerOutage {
         self.epoch.elapsed().as_millis() as u64 + 1
     }
 
-    /// A poll failed: the connection was lost, or a reconnect failed.
+    /// A poll failed: the connection was lost, or a reconnect failed. A connection on trial lost
+    /// is one more attempt of its outage.
     fn failed(&self, error: &ConnectionError) {
         let now = self.stamp();
+        self.connected_at.store(0, Ordering::SeqCst);
         if self
             .since
             .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
@@ -173,17 +187,36 @@ impl BrokerOutage {
         }
     }
 
-    /// The broker accepted a connection.
+    /// The broker accepted a connection. Outside an outage that is all; during one, the
+    /// connection is on trial until it has lasted `STABLE_AFTER` (`alive`).
     fn connected(&self) {
+        if self.since.load(Ordering::SeqCst) == 0 {
+            info!("Connected to MQTT broker");
+            return;
+        }
+        self.connected_at.store(self.stamp(), Ordering::SeqCst);
+        debug!(
+            attempts = self.attempts.load(Ordering::SeqCst),
+            "MQTT broker accepted a connection; the outage ends once it lasts"
+        );
+    }
+
+    /// The broker sent something on the current connection. Once a connection on trial has lasted
+    /// `STABLE_AFTER`, the outage is over: an INFO with its length, up to that connection.
+    fn alive(&self) {
+        let connected_at = self.connected_at.load(Ordering::SeqCst);
+        if connected_at == 0 || self.stamp().saturating_sub(connected_at) < STABLE_AFTER.as_millis() as u64 {
+            return;
+        }
+        self.connected_at.store(0, Ordering::SeqCst);
         let since = self.since.swap(0, Ordering::SeqCst);
         if since == 0 {
-            info!("Connected to MQTT broker");
             return;
         }
         info!(
             kind = "external_recovered",
             attempts = self.attempts.load(Ordering::SeqCst),
-            down_for_ms = self.stamp().saturating_sub(since),
+            down_for_ms = connected_at.saturating_sub(since),
             "MQTT broker reachable again"
         );
     }
@@ -286,6 +319,7 @@ impl Pump {
             // rumqttc during reconnection attempts and must NOT reset the counter.
             if matches!(event, Event::Incoming(_)) {
                 consecutive_errors = 0;
+                outage.alive();
             }
 
             let forward = match event {

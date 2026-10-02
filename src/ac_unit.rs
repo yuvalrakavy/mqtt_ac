@@ -126,8 +126,12 @@ impl UnitState {
     }
 
     fn parse_temperature(temperature: &str) -> Result<f32, Report<CoolmasterError>> {
-        let unit = temperature.chars().last().ok_or_else(|| CoolmasterError::InvalidTemperature(String::from(temperature)))?;
-        let value = temperature[0..temperature.len() - 1].parse::<f32>().map_err(|_| CoolmasterError::InvalidTemperature(String::from(temperature)))?;
+        let invalid = || CoolmasterError::InvalidTemperature(String::from(temperature));
+        // The value, and its unit: the last character, whatever its width in bytes — a byte slice
+        // at `len() - 1` panics inside a multibyte one ("25°"), ending the worker (re-review C5).
+        let mut chars = temperature.chars();
+        let unit = chars.next_back().ok_or_else(invalid)?;
+        let value = chars.as_str().parse::<f32>().map_err(|_| invalid())?;
 
         let temperature = match unit {
             'C' => value,
@@ -141,6 +145,32 @@ impl UnitState {
 
 #[cfg(test)]
 mod tests {
+    /// A temperature whose last character takes more than one byte ("25°", line noise) is a
+    /// listing the bridge cannot use — an error the worker reports and passes over — not a panic
+    /// that ends the Coolmaster worker (re-review C5).
+    #[test]
+    fn a_temperature_ending_in_a_multibyte_character_is_an_error_not_a_panic() {
+        let parsed = std::panic::catch_unwind(|| {
+            let temperature = super::UnitState::parse_temperature("25°").is_err();
+            let line = super::UnitState::from_str("L1.001 ON 25° 23.0C High Cool OK - 0").is_err();
+            temperature && line
+        });
+        assert!(
+            matches!(parsed, Ok(true)),
+            "a temperature ending in a multibyte character was not an error: {}",
+            match parsed {
+                Ok(_) => "it parsed".to_owned(),
+                Err(panic) => format!(
+                    "it panicked ({})",
+                    panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .unwrap_or_else(|| "no message".to_owned())
+                ),
+            }
+        );
+    }
+
     #[test]
     #[ignore]
     fn test_parse_temperature() {

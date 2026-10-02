@@ -11,7 +11,7 @@ use std::time::Duration;
 use mqtt_test_broker::FakeBroker;
 
 use super::{broker_host_port, Service, ServiceConfig, Started, Timing};
-use crate::test_support::{Capture, FakeCoolmaster, Relay, UNITS};
+use crate::test_support::{Answer, Capture, FakeCoolmaster, Relay, UNITS};
 
 const NAME: &str = "Saturation";
 const UNIT: &str = UNITS[0];
@@ -26,12 +26,16 @@ fn start_service(broker: &str, coolmaster: &str) -> Service<Started> {
 }
 
 fn start_service_with(broker: &str, coolmaster: &str, timing: Timing) -> Service<Started> {
+    // One listing at start; the tests make the rest.
+    start_service_polling(broker, coolmaster, timing, Duration::from_secs(3600))
+}
+
+fn start_service_polling(broker: &str, coolmaster: &str, timing: Timing, polling_period: Duration) -> Service<Started> {
     Service::new(ServiceConfig {
         controller_name: NAME.to_owned(),
         mqtt_broker_address: broker.to_owned(),
         coolmaster_address: coolmaster.to_owned(),
-        // One listing at start; the tests make the rest.
-        polling_period: Duration::from_secs(3600),
+        polling_period,
         timing,
     })
     .start()
@@ -423,13 +427,13 @@ async fn a_reset_filter_while_the_coolmaster_is_down_is_refused_with_an_error() 
 /// unit stays as it is, and the Store keeps showing the old one. After every CONNACK the publisher
 /// sends again the retained state it knows.
 ///
-/// The broker withholds its acks and takes two QoS 1 publishes in flight, so the unit's state from
-/// the start-up listing is still waiting in rumqttc when the connection drops. (Sometimes only one
-/// is taken: a subscription takes a packet id too, and a publish whose id collides with the held
-/// one stops rumqttc taking requests. Either way the state is still waiting — which is checked.)
+/// The broker withholds its acks and takes one QoS 1 publish in flight — the Coolmaster flag or
+/// the active flag, whichever goes first: the unit's state never does, as the flag is reported
+/// before it — so the unit's state from the start-up listing is still waiting in rumqttc when the
+/// connection drops (which is checked).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_state_a_reconnect_dropped_is_published_again() {
-    let broker = FakeBroker::start_with_receive_max(2).await;
+    let broker = FakeBroker::start_with_receive_max(1).await;
     broker.hold_acks();
     let relay = Relay::start(broker.address()).await;
     let coolmaster = FakeCoolmaster::start_steady().await;
@@ -478,7 +482,8 @@ async fn a_state_a_reconnect_dropped_is_published_again() {
 
 /// A broker outage is one episode however many MQTT sessions it outlasts (logging policy): an
 /// INFO when it starts, one WARN once it has lasted past its threshold, and an INFO with its
-/// length when the broker is back. The pump gives up after five failed polls a second apart and
+/// length once the broker is back and its connection has lasted. The pump gives up after five
+/// failed polls a second apart and
 /// the worker starts a new session, so an outage spans several; outage state kept per session
 /// logs each one as a new outage, with a WARN of its own.
 #[tokio::test]
@@ -500,6 +505,11 @@ async fn a_broker_outage_across_sessions_is_one_episode_in_the_log() {
     let back = broker
         .wait_for_subscription(&command_topic(), Duration::from_secs(20))
         .await;
+    // The outage is over once the new connection has lasted (`mqtt_pump::STABLE_AFTER`).
+    let _ = wait_for(Duration::from_secs(15), || {
+        !log.of_kind("external_recovered").is_empty()
+    })
+    .await;
     stop_service(service).await;
 
     assert!(back, "the bridge never reconnected once the broker was back");
@@ -527,6 +537,214 @@ async fn a_broker_outage_across_sessions_is_one_episode_in_the_log() {
             && recovered[0].level == tracing::Level::INFO
             && down_for.is_some_and(|ms| ms >= 7000),
         "the outage's end was not one INFO `external_recovered` with its whole length (`down_for_ms`); the log: {:#?}",
+        log.records()
+    );
+}
+
+fn coolmaster_topic() -> String {
+    format!("Aircondition/Coolmaster/{NAME}")
+}
+
+/// Every Coolmaster flag the broker received, in order (`true` or `false`).
+fn coolmaster_flags(broker: &FakeBroker) -> Vec<String> {
+    broker
+        .received_on(&coolmaster_topic())
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
+        .collect()
+}
+
+/// How many times the stand-in Coolmaster received exactly `command`.
+fn received(coolmaster: &FakeCoolmaster, command: &str) -> usize {
+    coolmaster.commands().iter().filter(|c| *c == command).count()
+}
+
+/// The Coolmaster worker never waits on MQTT (re-review C1; the skill's rule: the device side
+/// reports through a path that never waits). With the broker withholding its acknowledgements,
+/// rumqttc's request channel fills, then anything queued for the publisher; a listing every 20 ms,
+/// each a change for both units, fills them within about two seconds. A command for the Coolmaster
+/// must still reach it: it arrives over MQTT (the broker still delivers), goes to the mailbox, and
+/// the worker applies it. A worker that hands its reports to the publisher through a bounded queue
+/// waits there instead, for as long as the broker stalls — and takes no command meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_coolmaster_worker_takes_commands_while_the_broker_is_stalled() {
+    let broker = FakeBroker::start_with_receive_max(2).await;
+    let coolmaster = FakeCoolmaster::start().await;
+    let service = start_service_polling(
+        &broker.address(),
+        &coolmaster.address,
+        Timing::default(),
+        Duration::from_millis(20),
+    );
+
+    assert!(
+        broker
+            .wait_for_subscription(&command_topic(), Duration::from_secs(10))
+            .await,
+        "the session never subscribed"
+    );
+    assert!(
+        broker
+            .wait_until(Duration::from_secs(10), |b| {
+                !b.received_on(&state_topic(UNIT)).is_empty()
+            })
+            .await,
+        "the start-up listing was never published"
+    );
+    broker.hold_acks();
+    // Time for the listings to fill everything between the worker and the stalled broker.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(broker.send(&command_topic(), set_power(UNIT, false)));
+    let applied = wait_for(Duration::from_secs(5), || {
+        received(&coolmaster, "off L1.001") > 0
+    })
+    .await;
+    broker.release_acks();
+    stop_service(service).await;
+    assert!(
+        applied,
+        "with the broker stalled, a command never reached the Coolmaster: the Coolmaster worker waited on MQTT to take \
+         its reports"
+    );
+}
+
+/// The Coolmaster flag says `true` only once the Coolmaster has answered (re-review C4): a
+/// Coolmaster that takes the connection, gives its prompt and then closes on every command is not
+/// connected in any sense the Store cares about. Said on the connect, the flag flips true and false
+/// on every attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_coolmaster_flag_says_true_only_once_the_coolmaster_has_answered() {
+    let broker = FakeBroker::start().await;
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.cap_connections(12);
+    coolmaster.answer("", Answer::Close);
+    let timing = Timing {
+        device_retry: Duration::from_millis(300),
+        ..Timing::default()
+    };
+    let service = start_service_with(&broker.address(), &coolmaster.address, timing);
+
+    assert!(
+        broker
+            .wait_for_subscription(&command_topic(), Duration::from_secs(10))
+            .await,
+        "the session never subscribed"
+    );
+    let attempts = wait_for(Duration::from_secs(5), || coolmaster.served() >= 3).await;
+    // Time for whatever the attempts published to reach the broker.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let flags = coolmaster_flags(&broker);
+    stop_service(service).await;
+    assert!(
+        attempts,
+        "the worker connected fewer than three times, so this test proves nothing"
+    );
+    assert!(
+        !flags.iter().any(|f| f == "true"),
+        "the Coolmaster flag said true for a Coolmaster that took each connection and answered no command: {flags:?}"
+    );
+}
+
+/// The Coolmaster flag says `false` as soon as the worker finds the connection gone (re-review
+/// C4), not once it has waited out its reconnect pacing: meanwhile the mailbox already refuses
+/// momentary commands as "not connected", and the Store would show the Coolmaster as connected.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_coolmaster_flag_says_false_as_soon_as_the_connection_is_lost() {
+    let broker = FakeBroker::start().await;
+    let coolmaster = FakeCoolmaster::start().await;
+    let timing = Timing {
+        device_retry: Duration::from_secs(6),
+        ..Timing::default()
+    };
+    let service = start_service_with(&broker.address(), &coolmaster.address, timing);
+    let last_is = |b: &FakeBroker, flag: &str| coolmaster_flags(b).last().is_some_and(|f| f == flag);
+
+    let connected = broker
+        .wait_until(Duration::from_secs(10), |b| last_is(b, "true"))
+        .await;
+    coolmaster.set_up(false);
+    // A command, so the worker uses the connection and finds it gone.
+    assert!(broker.send(&command_topic(), set_power(UNIT, false)));
+    let flagged = broker
+        .wait_until(Duration::from_secs(2), |b| last_is(b, "false"))
+        .await;
+    let flags = coolmaster_flags(&broker);
+    stop_service(service).await;
+    assert!(
+        connected,
+        "the Coolmaster flag never said true, so this test proves nothing: {flags:?}"
+    );
+    assert!(
+        flagged,
+        "the connection to the Coolmaster was lost, but 2 s later its flag still said true — it waited out the \
+         reconnect pacing: {flags:?}"
+    );
+}
+
+/// A broker that takes each connection and loses it soon after is one outage, not one per
+/// connection (re-review C9, the fleet's F2): recovery is declared once a connection has lasted,
+/// not on its CONNACK. Declared on the CONNACK, every connection logs an INFO pair — recovered,
+/// lost — and the outage's WARN never comes, however long it lasts.
+#[tokio::test]
+async fn a_broker_that_drops_every_connection_is_one_outage_with_its_warn() {
+    let broker = FakeBroker::start().await;
+    let relay = Relay::start(broker.address()).await;
+    let coolmaster = FakeCoolmaster::start().await;
+    let log = Capture::start();
+    let timing = Timing {
+        mqtt_retry: Duration::from_secs(1),
+        broker_warn_after: Duration::from_secs(2),
+        ..Timing::default()
+    };
+    let service = start_service_with(&relay.address, &coolmaster.address, timing);
+    assert!(
+        broker
+            .wait_for_subscription(&command_topic(), Duration::from_secs(10))
+            .await,
+        "the session never subscribed"
+    );
+
+    // From now on each connection is lost 300 ms after it is made.
+    relay.drop_connections_after(Some(Duration::from_millis(300)));
+    let before = relay.accepted();
+    relay.cut();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let flaps = relay.accepted() - before;
+    relay.drop_connections_after(None);
+    let recovered = wait_for(Duration::from_secs(20), || {
+        !log.of_kind("external_recovered").is_empty()
+    })
+    .await;
+    stop_service(service).await;
+
+    assert!(
+        flaps >= 3,
+        "only {flaps} connections were made and lost, so this test proves nothing"
+    );
+    let lost = log.of_kind("connection_lost");
+    assert!(
+        lost.len() == 1 && lost[0].level == tracing::Level::INFO,
+        "a broker that lost every connection soon after making it was logged as {} outages, not one; the log: {:#?}",
+        lost.len(),
+        log.records()
+    );
+    let warnings = log.at_least(tracing::Level::WARN);
+    assert!(
+        warnings.len() == 1
+            && warnings[0].kind == "external_failure"
+            && warnings[0].field("attempts").is_some()
+            && warnings[0].field("down_for_ms").is_some(),
+        "the outage was not one WARN `external_failure` with its attempts and length; the log: {:#?}",
+        log.records()
+    );
+    let recoveries = log.of_kind("external_recovered");
+    let down_for = recoveries
+        .first()
+        .and_then(|r| r.field("down_for_ms"))
+        .and_then(|ms| ms.parse::<u64>().ok());
+    assert!(
+        recovered && recoveries.len() == 1 && down_for.is_some_and(|ms| ms >= 5000),
+        "the outage's end was not one INFO `external_recovered` with its whole length; the log: {:#?}",
         log.records()
     );
 }
