@@ -1,14 +1,16 @@
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 use error_stack::{Report, ResultExt};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::ac_unit::{self, UnitState};
 use crate::error::CoolmasterError;
+use crate::mailbox::{refusal_text, Mailbox, Refusal};
 use crate::messages::{ToCoolmasterMessage, ToMqttPublisherMessage};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -18,11 +20,132 @@ async fn timed<T>(
     fut: impl std::future::Future<Output = std::io::Result<T>>,
     description: &str,
 ) -> Result<T, Report<CoolmasterError>> {
-    match timeout(COMMAND_TIMEOUT, fut).await { // WAIT: coolmaster-io
+    // WAIT: coolmaster-io
+    match timeout(COMMAND_TIMEOUT, fut).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(io_err)) => Err(CoolmasterError::IoError(io_err).into()),
         Err(_) => Err(CoolmasterError::Timeout(description.to_string()).into()),
     }
+}
+
+/// How the worker paces its attempts to reach the Coolmaster, and when an outage is a WARN.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceTiming {
+    pub retry: Duration,
+    pub warn_after: Duration,
+}
+
+impl Default for DeviceTiming {
+    fn default() -> DeviceTiming {
+        DeviceTiming {
+            retry: Duration::from_secs(5),
+            warn_after: Duration::from_secs(30),
+        }
+    }
+}
+
+/// The Coolmaster's reachability as the worker sees it. The worker outlives every connection, so
+/// an outage is one episode however many attempts it takes (the logging policy, and the owner's
+/// device-down policy): an INFO when it starts, one WARN once it has lasted `warn_after`, the
+/// attempts in between counted at DEBUG, and an INFO with its length when the Coolmaster is back.
+struct DeviceOutage {
+    warn_after: Duration,
+    current: Option<Episode>,
+}
+
+struct Episode {
+    since: Instant,
+    attempts: u32,
+    warned: bool,
+}
+
+impl DeviceOutage {
+    fn new(warn_after: Duration) -> DeviceOutage {
+        DeviceOutage {
+            warn_after,
+            current: None,
+        }
+    }
+
+    /// The connection was lost, or an attempt to connect failed.
+    fn failed(&mut self, error: &Report<CoolmasterError>) {
+        let Some(episode) = &mut self.current else {
+            self.current = Some(Episode {
+                since: Instant::now(),
+                attempts: 1,
+                warned: false,
+            });
+            info!(kind = "device_connection_lost", error = %error, "Coolmaster unreachable; retrying");
+            return;
+        };
+        episode.attempts += 1;
+        let down_for_ms = episode.since.elapsed().as_millis() as u64;
+        if !episode.warned && episode.since.elapsed() >= self.warn_after {
+            episode.warned = true;
+            warn!(
+                kind = "device_unreachable",
+                error = %error,
+                attempts = episode.attempts,
+                down_for_ms,
+                "Coolmaster unreachable; still retrying"
+            );
+        } else {
+            debug!(error = %error, attempts = episode.attempts, down_for_ms, "Coolmaster still unreachable");
+        }
+    }
+
+    /// Connected, with the state set meanwhile applied and the units' observed state published.
+    fn recovered(&mut self, applied: usize, refused: u32) {
+        match self.current.take() {
+            Some(episode) => info!(
+                kind = "device_recovered",
+                down_for_ms = episode.since.elapsed().as_millis() as u64,
+                attempts = episode.attempts,
+                applied,
+                refused,
+                "Coolmaster reachable again"
+            ),
+            None => info!("Connected to coolmaster controller"),
+        }
+    }
+}
+
+/// Report, on the error topic, the momentary commands the mailbox refused when the connection
+/// went down: they were waiting, and will not be sent.
+async fn report_refused(
+    publisher: &Sender<ToMqttPublisherMessage>,
+    refused: Vec<ToCoolmasterMessage>,
+) {
+    for command in refused {
+        let text = refusal_text(&command, Refusal::CoolmasterDown);
+        // WAIT: publisher-queue
+        let _ = publisher.send(ToMqttPublisherMessage::Error(text)).await;
+    }
+}
+
+/// A command the Coolmaster answered with an error status: the command failed, the connection
+/// did not.
+fn rejected(e: &Report<CoolmasterError>) -> Option<&str> {
+    match e.downcast_ref::<CoolmasterError>() {
+        Some(CoolmasterError::CoolmasterCommandError(status)) => Some(status),
+        _ => None,
+    }
+}
+
+/// Whether the connection itself failed — an I/O error, a timeout, the Coolmaster closing it —
+/// rather than the Coolmaster answering with something the bridge could not use.
+fn connection_failed(e: &Report<CoolmasterError>) -> bool {
+    e.frames()
+        .filter_map(|frame| frame.downcast_ref::<CoolmasterError>())
+        .any(|error| {
+            matches!(
+                error,
+                CoolmasterError::IoError(_)
+                    | CoolmasterError::Timeout(_)
+                    | CoolmasterError::ConnectionClosed
+                    | CoolmasterError::NotConnected
+            )
+        })
 }
 
 pub struct Coolmaster {
@@ -31,18 +154,24 @@ pub struct Coolmaster {
 
 #[allow(dead_code)]
 impl Coolmaster {
+    /// Owns the Coolmaster connection. It takes commands from the mailbox only while connected
+    /// (the owner's device-down policy): on each connect it applies the state set while it was
+    /// down, then reads and publishes every unit's observed state. Nothing waits on it — the
+    /// mailbox never does — so its own waits (the Coolmaster, under `COMMAND_TIMEOUT`; the
+    /// publisher's queue) hold nothing else up.
     pub async fn coolmaster_worker(
         coolmaster_address: &str,
-        to_coolmaster_channel: Receiver<ToCoolmasterMessage>,
+        mailbox: Arc<Mailbox>,
         to_mqtt_publisher_channel: Sender<ToMqttPublisherMessage>,
+        timing: DeviceTiming,
     ) {
         let mut coolmaster = Coolmaster::new();
+        let mut outage = DeviceOutage::new(timing.warn_after);
+        let publisher = &to_mqtt_publisher_channel;
 
         loop {
-            // Work loop
-
             // WAIT: publisher-queue
-            if to_mqtt_publisher_channel
+            if publisher
                 .send(ToMqttPublisherMessage::CoolmasterConnected(false))
                 .await
                 .is_err()
@@ -51,76 +180,113 @@ impl Coolmaster {
                 return;
             }
 
-            loop {
-                // Reconnect loop
-                match coolmaster.connect_to(coolmaster_address).await {
-                    Ok(_) => {
-                        info!("Connected to coolmaster controller");
-                        // WAIT: publisher-queue
-                        if to_mqtt_publisher_channel
-                            .send(ToMqttPublisherMessage::CoolmasterConnected(true))
-                            .await
-                            .is_err()
-                        {
-                            info!("MQTT publisher channel closed, exiting coolmaster worker");
-                            return;
-                        }
-                        break;
-                    }
+            while let Err(e) = coolmaster.connect_to(coolmaster_address).await {
+                outage.failed(&e);
+                report_refused(publisher, mailbox.disconnected()).await;
+                // WAIT: publisher-queue
+                let _ = publisher
+                    .send(ToMqttPublisherMessage::Error(format!("{e:#?}")))
+                    .await;
+                tokio::time::sleep(timing.retry).await;
+            }
 
-                    Err(e) => {
-                        info!("Failed to connect to coolmaster controller: {e}");
-                        // WAIT: publisher-queue
-                        let _ = to_mqtt_publisher_channel
-                            .send(ToMqttPublisherMessage::Error(format!("{e:#?}")))
-                            .await;
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
+            let back = mailbox.connected();
+            // WAIT: publisher-queue
+            if publisher
+                .send(ToMqttPublisherMessage::CoolmasterConnected(true))
+                .await
+                .is_err()
+            {
+                info!("MQTT publisher channel closed, exiting coolmaster worker");
+                return;
+            }
+            match coolmaster.catch_up(back.pending, &mailbox, publisher).await {
+                Ok(applied) => outage.recovered(applied, back.refused),
+                Err(e) => {
+                    coolmaster.lost(&e, &mailbox, publisher, &mut outage).await;
+                    continue;
                 }
             }
 
             loop {
-                let message = match to_coolmaster_channel.recv().await { // WAIT: coolmaster-commands
-                    Ok(msg) => msg,
-                    Err(_) => {
-                        info!("Coolmaster command channel closed, exiting worker");
-                        return;
-                    }
-                };
-
-                if let Err(e) = coolmaster
-                    .handle_message(&message, &to_mqtt_publisher_channel)
-                    .await
-                {
+                // WAIT: coolmaster-mailbox
+                let message = mailbox.take().await;
+                if let Err(e) = coolmaster.handle_message(&message, publisher).await {
                     // WAIT: publisher-queue
-                    let _ = to_mqtt_publisher_channel
+                    let _ = publisher
                         .send(ToMqttPublisherMessage::Error(format!(
                             "Failed to handle {message:#?} - {e}"
                         )))
                         .await;
-
-                    if let Some(CoolmasterError::CoolmasterCommandError(cmd_err)) =
-                        e.downcast_ref::<CoolmasterError>()
-                    {
+                    if let Some(status) = rejected(&e) {
                         // Command rejected by coolmaster (e.g. invalid unit id): external device error.
-                        warn!(
-                            kind = "external_failure",
-                            error = %cmd_err,
-                            "Coolmaster command rejected"
-                        );
-                    } else {
-                        // TCP-level failure: designed degradation, reconnect will fire.
-                        info!(
-                            kind = "connection_lost",
-                            error = %e,
-                            "Coolmaster connection lost, reconnecting"
-                        );
-                        coolmaster.stream = None;
-                        break;
+                        warn!(kind = "external_failure", error = %status, "Coolmaster command rejected");
+                        continue;
                     }
+                    // A state is idempotent: what could not be applied waits for the next connection.
+                    mailbox.restore(vec![message]);
+                    coolmaster.lost(&e, &mailbox, publisher, &mut outage).await;
+                    break;
                 }
             }
         }
+    }
+
+    /// Just connected: apply the state set while the Coolmaster was down, in order, then read and
+    /// publish every unit's observed state, so the Store shows what is true. Returns how many of
+    /// the states were applied. An error is the connection failing; the states not yet applied
+    /// (and the one in flight) go back to the mailbox. A listing the bridge cannot use is reported
+    /// and passed over — the polling lists again — so it never keeps the worker from its mailbox.
+    async fn catch_up(
+        &mut self,
+        pending: Vec<ToCoolmasterMessage>,
+        mailbox: &Mailbox,
+        publisher: &Sender<ToMqttPublisherMessage>,
+    ) -> Result<usize, Report<CoolmasterError>> {
+        let mut applied = 0;
+        let mut pending = pending.into_iter();
+        while let Some(command) = pending.next() {
+            match self.handle_message(&command, publisher).await {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    // WAIT: publisher-queue
+                    let _ = publisher
+                        .send(ToMqttPublisherMessage::Error(format!(
+                            "Failed to handle {command:#?} - {e}"
+                        )))
+                        .await;
+                    if let Some(status) = rejected(&e) {
+                        warn!(kind = "external_failure", error = %status, "Coolmaster command rejected");
+                        continue;
+                    }
+                    mailbox.restore(std::iter::once(command).chain(pending).collect());
+                    return Err(e);
+                }
+            }
+        }
+        let list = ToCoolmasterMessage::PublishUnitsState;
+        if let Err(e) = self.handle_message(&list, publisher).await {
+            if connection_failed(&e) {
+                return Err(e);
+            }
+            let text = format!("Failed to handle {list:#?} - {e}");
+            // WAIT: publisher-queue
+            let _ = publisher.send(ToMqttPublisherMessage::Error(text)).await;
+        }
+        Ok(applied)
+    }
+
+    /// The connection failed: drop it, and stop taking from the mailbox until the next connect.
+    async fn lost(
+        &mut self,
+        error: &Report<CoolmasterError>,
+        mailbox: &Mailbox,
+        publisher: &Sender<ToMqttPublisherMessage>,
+        outage: &mut DeviceOutage,
+    ) {
+        self.stream = None;
+        outage.failed(error);
+        report_refused(publisher, mailbox.disconnected()).await;
     }
 
     fn new() -> Self {
@@ -355,6 +521,9 @@ impl Coolmaster {
 }
 
 #[cfg(test)]
+mod worker_tests;
+
+#[cfg(test)]
 mod tests {
     const COOLMASTER_ADDRESS: &str = "10.0.1.70";
 
@@ -370,11 +539,12 @@ mod tests {
     async fn test_coolmaster_worker() {
         set_logger();
 
-        let (to_coolmaster_tx, to_coolmaster_rx) = async_channel::bounded(10);
+        let mailbox = crate::mailbox::Mailbox::new();
         let (to_mqtt_tx, to_mqtt_rx) = async_channel::bounded(10);
 
+        let worker_mailbox = mailbox.clone();
         let handle = tokio::spawn(async move {
-            super::Coolmaster::coolmaster_worker(COOLMASTER_ADDRESS, to_coolmaster_rx, to_mqtt_tx)
+            super::Coolmaster::coolmaster_worker(COOLMASTER_ADDRESS, worker_mailbox, to_mqtt_tx, Default::default())
                 .await;
         });
 
@@ -385,10 +555,7 @@ mod tests {
             }
         });
 
-        to_coolmaster_tx
-            .send(super::ToCoolmasterMessage::PublishUnitsState)
-            .await
-            .unwrap();
+        mailbox.post(super::ToCoolmasterMessage::PublishUnitsState);
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         handle.abort();
         println!("Test done");

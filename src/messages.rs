@@ -1,6 +1,7 @@
 use crate::ac_unit::{UnitState, FanSpeed, OperationMode};
 
-#[derive(Debug)]
+/// A command for the Coolmaster worker, posted to its mailbox (`mailbox.rs` classifies them).
+#[derive(Debug, Clone, PartialEq)]
 pub enum ToCoolmasterMessage {
     PublishUnitState(String),
     PublishUnitsState,

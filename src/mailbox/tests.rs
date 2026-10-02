@@ -1,0 +1,299 @@
+//! The mailbox on its own: the device-down policy's three kinds of command.
+
+use std::time::Duration;
+
+use super::{Mailbox, Posted, Refusal, MOMENTARY_CAP};
+use crate::ac_unit::OperationMode;
+use crate::messages::ToCoolmasterMessage::{self, *};
+use crate::test_support::Capture;
+
+const U1: &str = "L1.001";
+const U2: &str = "L1.002";
+
+fn power(unit: &str, on: bool) -> ToCoolmasterMessage {
+    SetUnitPower(unit.to_owned(), on)
+}
+
+fn temperature(unit: &str, t: f32) -> ToCoolmasterMessage {
+    SetTargetTemperature(unit.to_owned(), t)
+}
+
+/// A mailbox whose worker has found the Coolmaster down.
+fn down() -> std::sync::Arc<Mailbox> {
+    let mailbox = Mailbox::new();
+    assert!(mailbox.disconnected().is_empty());
+    mailbox
+}
+
+#[test]
+fn state_set_while_down_keeps_the_latest_value_per_unit_and_property_in_the_order_last_set() {
+    let mailbox = down();
+    for command in [
+        power(U1, true),
+        temperature(U1, 20.0),
+        power(U2, true),
+        SetUnitMode(U2.to_owned(), OperationMode::Heat),
+        power(U1, false),
+        temperature(U1, 22.0),
+    ] {
+        assert_eq!(mailbox.post(command), Posted::Queued);
+    }
+    let back = mailbox.connected();
+    assert_eq!(
+        back.pending,
+        [
+            power(U2, true),
+            SetUnitMode(U2.to_owned(), OperationMode::Heat),
+            power(U1, false),
+            temperature(U1, 22.0),
+        ],
+        "the Coolmaster should get the latest value per unit and property, in the order last set"
+    );
+    assert!(
+        mailbox.waiting().is_empty(),
+        "the pending state was handed back and also left waiting"
+    );
+}
+
+#[test]
+fn a_momentary_command_is_refused_while_the_coolmaster_is_down() {
+    let mailbox = down();
+    assert_eq!(
+        mailbox.post(ResetFilter(U1.to_owned())),
+        Posted::Refused(Refusal::CoolmasterDown)
+    );
+    assert!(
+        mailbox.waiting().is_empty(),
+        "a refused momentary command was kept"
+    );
+    assert_eq!(
+        mailbox.connected().refused,
+        1,
+        "the refusal was not counted for the recovery line"
+    );
+    assert_eq!(
+        mailbox.post(ResetFilter(U1.to_owned())),
+        Posted::Queued,
+        "a momentary command was refused while the Coolmaster was connected"
+    );
+}
+
+#[test]
+fn reads_are_dropped_while_down_and_coalesced_while_up() {
+    let mailbox = down();
+    assert_eq!(
+        mailbox.post(PublishUnitState(U1.to_owned())),
+        Posted::Dropped
+    );
+    assert_eq!(mailbox.post(PublishUnitsState), Posted::Dropped);
+    assert!(mailbox.connected().pending.is_empty());
+
+    mailbox.post(PublishUnitState(U1.to_owned()));
+    mailbox.post(PublishUnitsState);
+    mailbox.post(power(U1, true));
+    mailbox.post(PublishUnitState(U1.to_owned()));
+    assert_eq!(
+        mailbox.waiting(),
+        [
+            PublishUnitsState,
+            power(U1, true),
+            PublishUnitState(U1.to_owned())
+        ],
+        "a read already waiting should answer the next one too, moved behind what was set since"
+    );
+}
+
+#[test]
+fn momentary_commands_past_the_cap_are_refused() {
+    let mailbox = Mailbox::new();
+    for _ in 0..MOMENTARY_CAP {
+        assert_eq!(mailbox.post(ResetFilter(U1.to_owned())), Posted::Queued);
+    }
+    assert_eq!(
+        mailbox.post(ResetFilter(U1.to_owned())),
+        Posted::Refused(Refusal::QueueFull)
+    );
+    // States are not counted against the cap.
+    assert_eq!(mailbox.post(power(U1, true)), Posted::Queued);
+}
+
+#[test]
+fn momentary_commands_waiting_when_the_coolmaster_goes_down_are_refused() {
+    let mailbox = Mailbox::new();
+    mailbox.post(ResetFilter(U1.to_owned()));
+    mailbox.post(PublishUnitState(U1.to_owned()));
+    mailbox.post(power(U1, true));
+    assert_eq!(
+        mailbox.disconnected(),
+        [ResetFilter(U1.to_owned())],
+        "the momentary command waiting at the disconnect was not refused"
+    );
+    assert_eq!(
+        mailbox.waiting(),
+        [power(U1, true)],
+        "only the state should wait for the Coolmaster's return"
+    );
+    let back = mailbox.connected();
+    assert_eq!(back.pending, [power(U1, true)]);
+    assert_eq!(back.refused, 1);
+}
+
+#[test]
+fn state_that_could_not_be_applied_goes_back_unless_superseded() {
+    let mailbox = down();
+    mailbox.post(temperature(U1, 23.0));
+    mailbox.restore(vec![
+        power(U1, true),
+        temperature(U1, 20.0),
+        ResetFilter(U1.to_owned()),
+        power(U2, false),
+    ]);
+    assert_eq!(
+        mailbox.waiting(),
+        [power(U1, true), power(U2, false), temperature(U1, 23.0)],
+        "restored states go back to the front in order, except one superseded meanwhile; nothing else goes back"
+    );
+}
+
+#[test]
+fn the_first_refusal_of_an_outage_is_logged_at_info_and_the_rest_at_debug() {
+    let log = Capture::start();
+    let mailbox = down();
+    for _ in 0..3 {
+        mailbox.post(ResetFilter(U1.to_owned()));
+    }
+    let refused = log.of_kind("command_refused");
+    assert!(
+        refused.len() == 1 && refused[0].level == tracing::Level::INFO,
+        "an outage's refusals were not one INFO then DEBUG; the log: {:#?}",
+        log.records()
+    );
+    assert_eq!(mailbox.connected().refused, 3);
+    mailbox.disconnected();
+    mailbox.post(ResetFilter(U1.to_owned()));
+    assert_eq!(
+        log.of_kind("command_refused").len(),
+        2,
+        "the next outage's first refusal was not logged at INFO"
+    );
+}
+
+/// A full momentary queue is an episode of its own: its first refusal is an INFO, the rest DEBUG,
+/// until it drains; and its refusals are not an outage's, so the recovery line does not count them.
+#[tokio::test]
+async fn a_full_momentary_queue_is_said_once_per_episode() {
+    let log = Capture::start();
+    let mailbox = Mailbox::new();
+    for _ in 0..MOMENTARY_CAP + 3 {
+        mailbox.post(ResetFilter(U1.to_owned()));
+    }
+    assert_eq!(
+        log.of_kind("command_refused").len(),
+        1,
+        "a full queue's refusals were not one INFO; the log: {:#?}",
+        log.records()
+    );
+    for _ in 0..MOMENTARY_CAP {
+        let taken = tokio::time::timeout(Duration::from_secs(5), mailbox.take()).await;
+        assert!(taken.is_ok(), "a waiting momentary command was not taken");
+    }
+    mailbox.post(ResetFilter(U1.to_owned()));
+    for _ in 0..MOMENTARY_CAP {
+        mailbox.post(ResetFilter(U1.to_owned()));
+    }
+    assert_eq!(
+        log.of_kind("command_refused").len(),
+        2,
+        "the queue's next episode, after it drained, was not said at INFO; the log: {:#?}",
+        log.records()
+    );
+    mailbox.disconnected();
+    assert_eq!(
+        mailbox.connected().refused,
+        MOMENTARY_CAP as u32,
+        "the recovery line should count the commands refused for the outage (those waiting at the disconnect), not \
+         those refused for a full queue"
+    );
+}
+
+/// Every log line is written with the mailbox's lock released: the posters and the worker would
+/// otherwise wait on the log's writers (synchronous, for the console and the file) under it.
+#[test]
+fn nothing_is_logged_under_the_mailbox_lock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    /// Counts the events emitted while the mailbox's lock is held.
+    struct Probe {
+        mailbox: Arc<Mailbox>,
+        under_lock: Arc<AtomicUsize>,
+        events: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Probe {
+        fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+            self.events.fetch_add(1, Ordering::SeqCst);
+            if self.mailbox.state.try_lock().is_err() {
+                self.under_lock.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let mailbox = Mailbox::new();
+    let (under_lock, events) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let probe = Probe {
+        mailbox: mailbox.clone(),
+        under_lock: under_lock.clone(),
+        events: events.clone(),
+    };
+    let _log = tracing::subscriber::set_default(tracing_subscriber::registry().with(probe));
+
+    // Refusals for a full queue, at the disconnect, and while down: every path that logs.
+    for _ in 0..MOMENTARY_CAP + 2 {
+        mailbox.post(ResetFilter(U1.to_owned()));
+    }
+    mailbox.disconnected();
+    mailbox.post(ResetFilter(U1.to_owned()));
+    mailbox.post(ResetFilter(U2.to_owned()));
+    mailbox.connected();
+
+    assert!(
+        events.load(Ordering::SeqCst) >= 4,
+        "the mailbox logged nothing, so this test proves nothing"
+    );
+    assert_eq!(
+        under_lock.load(Ordering::SeqCst),
+        0,
+        "the mailbox logged while holding its lock"
+    );
+}
+
+/// `take` waits for a post, and a post wakes it; a post never waits, however many there are and
+/// whether or not anything takes them.
+#[tokio::test]
+async fn take_waits_for_a_post_and_a_post_never_waits() {
+    let mailbox = Mailbox::new();
+    let taker = {
+        let mailbox = mailbox.clone();
+        tokio::spawn(async move { mailbox.take().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!taker.is_finished(), "take returned with nothing posted");
+    mailbox.post(power(U1, true));
+    let taken = tokio::time::timeout(Duration::from_secs(5), taker).await;
+    assert_eq!(
+        taken.ok().and_then(Result::ok),
+        Some(power(U1, true)),
+        "a post did not wake the waiting take"
+    );
+    for i in 0..10_000 {
+        mailbox.post(temperature(U1, (i % 30) as f32));
+        mailbox.post(PublishUnitsState);
+    }
+    assert_eq!(
+        mailbox.waiting().len(),
+        2,
+        "the mailbox grew past one entry per key"
+    );
+}

@@ -1,14 +1,17 @@
 use async_channel::Sender;
 use error_stack::{Report, ResultExt};
 use serde::Deserialize;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 use tracing::{debug, info, Instrument};
 
 use crate::{
     ac_unit::{FanSpeed, OperationMode},
     error::MqttError,
+    mailbox::{refusal_text, Mailbox, Posted},
     messages::{ToCoolmasterMessage, ToMqttPublisherMessage},
-    mqtt_pump::{Pump, PumpEvent},
+    mqtt_pump::{BrokerOutage, Pump, PumpEvent},
 };
 use rumqttc::v5::{self, mqttbytes::QoS, mqttbytes::v5::PublishProperties};
 
@@ -36,15 +39,19 @@ struct Command {
 }
 
 /// The bridge's MQTT session. It never polls: the pump polls in a task of its own and forwards
-/// what arrives, so this session may wait on the Coolmaster worker's queue, the publisher's queue
-/// and rumqttc's request channel — back-pressure, which the pump's polling keeps moving (Store
-/// no-hang §14.3). It ends when the pump does, and the worker starts a new one.
+/// what arrives. It never waits on the Coolmaster either: commands go to the Coolmaster's mailbox,
+/// which never waits (the owner's device-down policy), so every CONNACK is read and answered —
+/// resubscribed and announced — whatever the Coolmaster is doing. It may wait on the publisher's
+/// queue and on rumqttc's request channel: back-pressure, which the pump's polling keeps moving
+/// (Store no-hang §14.3). It ends when the pump does, and the worker starts a new session.
 pub async fn session(
     mqtt_event_loop: v5::EventLoop,
     mqtt_client: v5::AsyncClient,
     controller_name: String,
-    to_coolmaster_channel: Sender<ToCoolmasterMessage>,
+    mailbox: &Mailbox,
     to_mqtt_publish_channel: Sender<ToMqttPublisherMessage>,
+    reconnected: &Notify,
+    outage: Arc<BrokerOutage>,
 ) -> Result<(), Report<MqttError>> {
     let into_context = || MqttError::Context("MQTT subscriber session".to_string());
     let command_topic = format!("Aircondition/Command/{controller_name}");
@@ -52,21 +59,28 @@ pub async fn session(
     let version_topic = format!("Aircondition/Version/{controller_name}");
     let version = crate::get_version();
     // Polling first, so every publish below has an event loop draining it.
-    let (_pump, mut incoming) = Pump::start(mqtt_event_loop);
+    let (_pump, mut incoming) = Pump::start(mqtt_event_loop, outage);
 
     loop {
         debug!("Waiting for MQTT message");
 
-        let publish_packet = match incoming.recv().await { // WAIT: mqtt-pump-queue
+        // WAIT: mqtt-pump-queue
+        let event = incoming.recv().await;
+        let publish_packet = match event {
             Some(PumpEvent::Publish(publish_packet)) => publish_packet,
             Some(PumpEvent::Connected) => {
-                announce(&mqtt_client, &active_topic, &version_topic, &version, &command_topic)
+                let topics = [&command_topic, &active_topic, &version_topic];
+                announce(&mqtt_client, topics, &version)
                     .await
                     .change_context_lazy(into_context)?;
+                // A reconnect without a session dropped whatever rumqttc still held: the
+                // publisher sends again the retained state it knows.
+                reconnected.notify_one();
                 continue;
             }
             Some(PumpEvent::Ended(e)) => {
-                return Err(MqttError::ApiError(e, "Too many consecutive MQTT poll errors".to_string()).into())
+                let context = "Too many consecutive MQTT poll errors".to_string();
+                return Err(MqttError::ApiError(e, context).into());
             }
             None => return Err(MqttError::Context("the MQTT pump stopped".to_string()).into()),
         };
@@ -95,30 +109,18 @@ pub async fn session(
         // the current-span thread-local (fleet logging policy).
         let handled: Result<(), Report<MqttError>> = async {
             match serde_json::from_slice::<Command>(&publish_packet.payload) {
-                Ok(Command {
-                    unit,
-                    operation: Operation::Action(action),
-                }) => {
-                    perform_action(&unit, &action, &to_coolmaster_channel).await?;
-                    // WAIT: coolmaster-queue
-                    to_coolmaster_channel
-                        .send(ToCoolmasterMessage::PublishUnitState(unit))
-                        .await
-                        .change_context_lazy(into_context)?;
-                }
-                Ok(Command {
-                    unit,
-                    operation: Operation::ActionList(actions),
-                }) => {
-                    for action in actions {
-                        perform_action(&unit, &action, &to_coolmaster_channel).await?;
+                Ok(Command { unit, operation }) => {
+                    let actions = match operation {
+                        Operation::Action(action) => vec![action],
+                        Operation::ActionList(actions) => actions,
+                    };
+                    for action in &actions {
+                        let command = get_coolmaster_message_from_action(&unit, action);
+                        submit(command, mailbox, &to_mqtt_publish_channel).await?;
                     }
-
-                    // WAIT: coolmaster-queue
-                    to_coolmaster_channel
-                        .send(ToCoolmasterMessage::PublishUnitState(unit))
-                        .await
-                        .change_context_lazy(into_context)?;
+                    // Then the unit's state, so the change shows. A read is never refused.
+                    let read = ToCoolmasterMessage::PublishUnitState(unit);
+                    submit(read, mailbox, &to_mqtt_publish_channel).await?;
                 }
                 Err(e) => {
                     // Malformed payload is a designed degradation (user error), not a code bug.
@@ -146,16 +148,19 @@ pub async fn session(
 }
 
 /// On every CONNACK — rumqttc reconnects inside one event loop, and the broker keeps no session:
-/// the active flag, the version, and the command subscription. Made here, never by the pump, so a
-/// full request channel holds this session until the pump drains it, instead of stopping the
-/// polling that drains it.
+/// the command subscription, then the active flag and the version (`topics` is the command, the
+/// active and the version topic). Made here, never by the pump, so a full request channel holds
+/// this session until the pump drains it, instead of stopping the polling that drains it.
 async fn announce(
     mqtt_client: &v5::AsyncClient,
-    active_topic: &str,
-    version_topic: &str,
+    topics: [&String; 3],
     version: &str,
-    command_topic: &str,
 ) -> Result<(), Report<MqttError>> {
+    let [command_topic, active_topic, version_topic] = topics;
+    let failed = |what: &str| {
+        let what = what.to_string();
+        move |e: rumqttc::v5::ClientError| MqttError::ApiError(e.to_string(), what)
+    };
     // Stamp outbound publishes with traceparent if a trace is active.
     let mut props = PublishProperties::default();
     if let Some(tp) = tracing_init::traceparent::current() {
@@ -164,41 +169,44 @@ async fn announce(
 
     // WAIT: mqtt-request
     mqtt_client
-        .publish_with_properties(active_topic, QoS::AtLeastOnce, true, "true".as_bytes(), props.clone())
-        .await
-        .map_err(|e| MqttError::ApiError(e.to_string(), "Publish Active".to_string()))?;
-
-    // WAIT: mqtt-request
-    mqtt_client
-        .publish_with_properties(version_topic, QoS::AtLeastOnce, true, version.as_bytes().to_vec(), props)
-        .await
-        .map_err(|e| MqttError::ApiError(e.to_string(), "Publish Version".to_string()))?;
-
-    // WAIT: mqtt-request
-    mqtt_client
         .subscribe(command_topic, QoS::AtLeastOnce)
         .await
-        .map_err(|e| MqttError::ApiError(e.to_string(), "Subscribe to commands".to_string()))?;
+        .map_err(failed("Subscribe to commands"))?;
+
+    let active = "true".as_bytes();
+    // WAIT: mqtt-request
+    mqtt_client
+        .publish_with_properties(active_topic, QoS::AtLeastOnce, true, active, props.clone())
+        .await
+        .map_err(failed("Publish Active"))?;
+
+    let version = version.as_bytes().to_vec();
+    // WAIT: mqtt-request
+    mqtt_client
+        .publish_with_properties(version_topic, QoS::AtLeastOnce, true, version, props)
+        .await
+        .map_err(failed("Publish Version"))?;
 
     Ok(())
 }
 
-async fn perform_action(
-    unit: &str,
-    action: &Action,
-    to_coolmaster_channel: &Sender<ToCoolmasterMessage>,
+/// Post a command to the Coolmaster's mailbox, which never waits. A refused one is reported on the
+/// error topic, through the publisher's queue: back-pressure toward the broker, never the
+/// Coolmaster.
+async fn submit(
+    command: ToCoolmasterMessage,
+    mailbox: &Mailbox,
+    publisher: &Sender<ToMqttPublisherMessage>,
 ) -> Result<(), Report<MqttError>> {
-    let to_coolmaster_message = get_coolmaster_message_from_action(unit, action);
-
-    // WAIT: coolmaster-queue
-    to_coolmaster_channel
-        .send(to_coolmaster_message)
-        .await
-        .change_context_lazy(|| {
-            MqttError::Context(String::from(
-                "Sending action to coolmaster channel",
-            ))
-        })
+    if let Posted::Refused(why) = mailbox.post(command.clone()) {
+        let text = refusal_text(&command, why);
+        // WAIT: publisher-queue
+        publisher
+            .send(ToMqttPublisherMessage::Error(text))
+            .await
+            .change_context_lazy(|| MqttError::Context("Reporting a refused command".to_string()))?;
+    }
+    Ok(())
 }
 
 fn get_coolmaster_message_from_action(unit: &str, action: &Action) -> ToCoolmasterMessage {

@@ -762,6 +762,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-init",
+ "tracing-subscriber",
  "wait-lint",
 ]
 

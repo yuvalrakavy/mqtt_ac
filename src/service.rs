@@ -1,13 +1,17 @@
 use async_channel::{Receiver, Sender};
 use rumqttc::v5::{AsyncClient, EventLoop, MqttOptions, mqttbytes::QoS, mqttbytes::v5::LastWill};
 use std::marker::PhantomData;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio::{task::JoinSet, time::Duration};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
-    coolmaster::Coolmaster,
-    messages::{ToCoolmasterMessage, ToMqttPublisherMessage},
+    coolmaster::{Coolmaster, DeviceTiming},
+    mailbox::Mailbox,
+    messages::ToMqttPublisherMessage,
     mqtt_publisher::MqttPublisher,
+    mqtt_pump::BrokerOutage,
     mqtt_subscriber, polling,
 };
 
@@ -19,6 +23,32 @@ pub struct ServiceConfig {
     pub controller_name: String,
     pub coolmaster_address: String,
     pub polling_period: Duration,
+    pub timing: Timing,
+}
+
+/// How the bridge paces its reconnects, and how long an outage lasts before it is a WARN.
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    /// Between MQTT sessions: after one gives up (five failed polls in a row), a fresh client.
+    pub mqtt_retry: Duration,
+    /// How long the broker may be out of reach before the outage is a WARN.
+    pub broker_warn_after: Duration,
+    /// Between attempts to reach the Coolmaster.
+    pub device_retry: Duration,
+    /// How long the Coolmaster may be out of reach before the outage is a WARN.
+    pub device_warn_after: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Timing {
+        let device = DeviceTiming::default();
+        Timing {
+            mqtt_retry: Duration::from_secs(10),
+            broker_warn_after: Duration::from_secs(30),
+            device_retry: device.retry,
+            device_warn_after: device.warn_after,
+        }
+    }
 }
 
 pub struct Service<Status = Stopped> {
@@ -53,74 +83,68 @@ impl Service {
         AsyncClient::new(mqtt_options, 100)
     }
 
+    /// One MQTT session: a fresh client, its publisher and its subscriber session, until either
+    /// ends. Neither waits on this function, and the first to end ends the other (dropping it,
+    /// which drops the pump and its event loop).
     async fn mqtt_session(
         mqtt_broker: &str,
-        controller_name: impl Into<String>,
-        to_mqtt_publisher_rx: Receiver<ToMqttPublisherMessage>,
+        controller_name: &str,
+        publisher: &mut MqttPublisher,
+        mailbox: &Mailbox,
         to_mqtt_publisher_tx: Sender<ToMqttPublisherMessage>,
-        to_coolmaster_tx: Sender<ToCoolmasterMessage>,
+        outage: &Arc<BrokerOutage>,
     ) {
-        let controller_name = controller_name.into();
-        let mut sessions = JoinSet::new();
-
         let (mqtt_client, event_loop) =
-            Service::connect_to_mqtt_broker(mqtt_broker, &controller_name);
+            Service::connect_to_mqtt_broker(mqtt_broker, controller_name);
+        let reconnected = Notify::new();
 
-        let subscriber_client = mqtt_client.clone();
-        let subscriber_controller_name = controller_name.clone();
-
-        sessions.spawn(async move {
-            match MqttPublisher::session(
-                controller_name,
-                mqtt_client,
-                to_mqtt_publisher_rx,
-            )
-            .await
-            {
-                Ok(_) => info!("MQTT publisher session finished"),
-                Err(e) => info!("MQTT publisher session finished with error: {e:?}"),
+        // WAIT: session-join
+        tokio::select! {
+            result = publisher.session(&mqtt_client, &reconnected) => {
+                debug!(?result, "MQTT publisher session ended");
             }
-        });
-
-        sessions.spawn(async move {
-            match mqtt_subscriber::session(
+            result = mqtt_subscriber::session(
                 event_loop,
-                subscriber_client,
-                subscriber_controller_name,
-                to_coolmaster_tx,
+                mqtt_client.clone(),
+                controller_name.to_owned(),
+                mailbox,
                 to_mqtt_publisher_tx,
-            )
-            .await
-            {
-                Ok(_) => info!("MQTT subscriber session finished"),
-                Err(e) => info!("MQTT subscriber session finished with error: {e:?}"),
+                &reconnected,
+                outage.clone(),
+            ) => {
+                debug!(?result, "MQTT subscriber session ended");
             }
-        });
-
-        _ = sessions.join_next().await; // WAIT: session-join
-        _ = sessions.shutdown().await; // WAIT: task-shutdown
+        }
     }
 
+    /// The MQTT side, for the life of the service: sessions one after another. What must outlast a
+    /// session lives here — the publisher, with the retained state it knows, and the broker's
+    /// outage state, so an outage is one episode however many sessions it spans.
     async fn mqtt_worker(
         mqtt_broker: &str,
         controller_name: &str,
-        to_coolmaster_tx: Sender<ToCoolmasterMessage>,
+        timing: Timing,
+        mailbox: Arc<Mailbox>,
         to_mqtt_publisher_rx: Receiver<ToMqttPublisherMessage>,
         to_mqtt_publisher_tx: Sender<ToMqttPublisherMessage>,
     ) {
+        let outage = Arc::new(BrokerOutage::new(timing.broker_warn_after));
+        let mut publisher = MqttPublisher::new(controller_name.to_owned(), to_mqtt_publisher_rx);
         loop {
-            info!("Starting MQTT session");
+            debug!("Starting MQTT session");
             Service::mqtt_session(
                 mqtt_broker,
                 controller_name,
-                to_mqtt_publisher_rx.clone(),
+                &mut publisher,
+                &mailbox,
                 to_mqtt_publisher_tx.clone(),
-                to_coolmaster_tx.clone(),
+                &outage,
             )
             .await;
 
-            info!("MQTT terminated, waiting 10 seconds before restarting");
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // The outage, if that is why, is logged as one episode by `outage`.
+            debug!(retry_ms = timing.mqtt_retry.as_millis() as u64, "MQTT session ended; starting a new one");
+            tokio::time::sleep(timing.mqtt_retry).await;
         }
     }
 }
@@ -128,33 +152,41 @@ impl Service {
 impl Service<Stopped> {
     /// Spawns the workers on the current runtime; it waits on nothing.
     pub fn start(mut self) -> Service<Started> {
-        // Create the channels for the workers
-        let (to_coolmaster_tx, to_coolmaster_rx) = async_channel::bounded(10);
+        // The Coolmaster's commands, posted without waiting; the publisher's queue.
+        let mailbox = Mailbox::new();
         let (to_mqtt_publisher_tx, to_mqtt_publisher_rx) = async_channel::bounded(10);
+        let timing = self.config.timing;
 
         // Create coolmaster worker
 
         let coolmaster_address = self.config.coolmaster_address.clone();
         let to_mqtt_publisher_tx_instance = to_mqtt_publisher_tx.clone();
+        let device_timing = DeviceTiming {
+            retry: timing.device_retry,
+            warn_after: timing.device_warn_after,
+        };
+        let worker_mailbox = mailbox.clone();
         self.workers.spawn(async move {
             Coolmaster::coolmaster_worker(
                 &coolmaster_address,
-                to_coolmaster_rx,
+                worker_mailbox,
                 to_mqtt_publisher_tx_instance,
+                device_timing,
             )
             .await;
         });
 
         // Create mqtt publisher worker
         let controller_name = self.config.controller_name.clone();
-        let to_coolmaster_tx_instance = to_coolmaster_tx.clone();
         let mqtt_broker = self.config.mqtt_broker_address.clone();
+        let mqtt_mailbox = mailbox.clone();
 
         self.workers.spawn(async move {
             Self::mqtt_worker(
                 &mqtt_broker,
                 &controller_name,
-                to_coolmaster_tx_instance,
+                timing,
+                mqtt_mailbox,
                 to_mqtt_publisher_rx,
                 to_mqtt_publisher_tx,
             )
@@ -163,7 +195,7 @@ impl Service<Stopped> {
 
         // Create polling worker
         self.workers.spawn(async move {
-            polling::polling_worker(self.config.polling_period, to_coolmaster_tx).await;
+            polling::polling_worker(self.config.polling_period, mailbox).await;
         });
 
         info!("Service started");
@@ -177,7 +209,8 @@ impl Service<Stopped> {
 
 impl Service<Started> {
     pub async fn stop(mut self) -> Service<Stopped> {
-        self.workers.shutdown().await; // WAIT: task-shutdown
+        // WAIT: task-shutdown
+        self.workers.shutdown().await;
         info!("Service stopped");
 
         Service {

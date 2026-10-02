@@ -1,20 +1,15 @@
 use tokio::time::Duration;
-use async_channel::Sender;
-use crate::messages::ToCoolmasterMessage;
+use std::sync::Arc;
+use crate::{mailbox::Mailbox, messages::ToCoolmasterMessage};
 
-use tracing::{debug, info};
+use tracing::debug;
 
-pub async fn polling_worker(
-    poll_period: Duration,
-    to_coolmaster_channel: Sender<ToCoolmasterMessage>
-) {
+/// Asks for every unit's state each period. A post never waits; while the Coolmaster is down the
+/// read is dropped, and its return publishes every unit's state anyway.
+pub async fn polling_worker(poll_period: Duration, mailbox: Arc<Mailbox>) {
     loop {
         debug!("Polling coolmaster");
-        let message = ToCoolmasterMessage::PublishUnitsState;
-        if to_coolmaster_channel.send(message).await.is_err() { // WAIT: coolmaster-queue
-            info!("Coolmaster channel closed, exiting polling worker");
-            return;
-        }
+        mailbox.post(ToCoolmasterMessage::PublishUnitsState);
         tokio::time::sleep(poll_period).await;
     }
 }
