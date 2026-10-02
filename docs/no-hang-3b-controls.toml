@@ -6,7 +6,14 @@
 # a9e654a: the broker blip with the Coolmaster down was never re-announced; every command set
 # while the Coolmaster was down was replayed; the ResetFilter got no error; the state a reconnect
 # dropped was never sent again; the broker outage was logged per session; the unread commands
-# were dropped silently; SIGTERM killed the bridge.)
+# were dropped silently; SIGTERM killed the bridge. Round 2's, on 9810935: a command answered
+# with something unusable spun connect-apply-fail; a Coolmaster closing on every command was
+# reconnected to at once; an outage's error was published on every retry; a rejection was logged
+# as `external_failure`.)
+#
+# The stand-in Coolmaster serves at most a few connections in the reconnect-loop tests, so a
+# mutant that spins is caught after a dozen connections, not thousands: uncapped, one spun 16,282
+# in four seconds, and their TIME_WAIT sockets used up this host's ephemeral ports.
 #
 # A row that drove the Coolmaster path through the pump's forward queue
 # (`the_pump_blocks_on_its_forward_queue_coolmaster_path`) is gone: with the mailbox the session
@@ -205,8 +212,8 @@ guard       = "observed_state_on_return"
 [[control]]
 name        = "an_unusable_listing_is_a_lost_connection"
 file        = "src/coolmaster.rs"
-anchor      = '''            if connection_failed(&e) {'''
-replacement = '''            if true || connection_failed(&e) {'''
+anchor      = '''            if command_failed(&list, &e, publisher).await {'''
+replacement = '''            if command_failed(&list, &e, publisher).await || true {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_listing_the_bridge_cannot_use"]
 expect_text = "was taken for a lost connection"
@@ -216,8 +223,8 @@ guard       = "catch_up_never_loops"
 [[control]]
 name        = "the_state_in_flight_at_a_drop_is_lost"
 file        = "src/coolmaster.rs"
-anchor      = '''                    mailbox.restore(vec![message]);'''
-replacement = '''                    // control: not restored'''
+anchor      = '''                        mailbox.restore(vec![message]);'''
+replacement = '''                        // control: not restored'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_coolmaster_outage_is_applied_refused_and_logged_as_one_episode"]
 expect_text = "should get the state in flight at the drop"
@@ -313,3 +320,56 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_shutdown_past_its_bound"]
 expect_text = "a shutdown that never ends was not cut short at its bound"
 guard       = "shutdown_bounded"
+
+# Round 2 (lead review): a command that fails without its connection failing — answered with
+# something the bridge cannot use — taken for a lost connection: put back, retried first thing on
+# the reconnect, failing again, for good.
+[[control]]
+name        = "a_failed_command_is_a_lost_connection"
+file        = "src/coolmaster.rs"
+anchor      = '''        None => debug!(error = %e, command = ?command, "Coolmaster reply unusable; command passed over"),
+    }
+    false
+}'''
+replacement = '''        None => debug!(error = %e, command = ?command, "Coolmaster reply unusable; command passed over"),
+    }
+    true
+}'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_command_answered_with_something_unusable"]
+expect_text = "was not passed over on its connection"
+guard       = "failed_command_passed_over"
+
+# Round 2: a connection lost soon after it was made is reconnected at once — a Coolmaster that
+# drops every connection is reconnected to as fast as it drops them.
+[[control]]
+name        = "a_lost_connection_is_reconnected_at_once"
+file        = "src/coolmaster.rs"
+anchor      = '''                tokio::time::sleep_until(at + timing.retry).await;'''
+replacement = '''                let _ = at;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_coolmaster_that_closes_on_every_command"]
+expect_text = "at once each time, not at its"
+guard       = "reconnect_paced"
+
+# Round 2: an unreachable Coolmaster's error published on every retry, not once per change.
+[[control]]
+name        = "an_outage_publishes_its_error_on_every_retry"
+file        = "src/coolmaster.rs"
+anchor      = '''        if episode.reported.as_ref() == Some(&error) {'''
+replacement = '''        if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_coolmaster_outage_publishes_its_error_once"]
+expect_text = "an outage whose error did not change published it"
+guard       = "outage_error_once"
+
+# Round 2: a rejected command logged with the broker outage's kind.
+[[control]]
+name        = "a_rejection_is_an_external_failure"
+file        = "src/coolmaster.rs"
+anchor      = '''kind = "command_rejected"'''
+replacement = '''kind = "external_failure"'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_command_the_coolmaster_rejects"]
+expect_text = "was not one WARN `command_rejected`"
+guard       = "command_rejected_kind"
