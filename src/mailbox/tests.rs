@@ -220,34 +220,21 @@ async fn a_full_momentary_queue_is_said_once_per_episode() {
 /// otherwise wait on the log's writers (synchronous, for the console and the file) under it.
 #[test]
 fn nothing_is_logged_under_the_mailbox_lock() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-
-    /// Counts the events emitted while the mailbox's lock is held.
-    struct Probe {
-        mailbox: Arc<Mailbox>,
-        under_lock: Arc<AtomicUsize>,
-        events: Arc<AtomicUsize>,
-    }
-
-    impl<S: tracing::Subscriber> Layer<S> for Probe {
-        fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
-            self.events.fetch_add(1, Ordering::SeqCst);
-            if self.mailbox.state.try_lock().is_err() {
-                self.under_lock.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-    }
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     let mailbox = Mailbox::new();
-    let (under_lock, events) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let probe = Probe {
-        mailbox: mailbox.clone(),
-        under_lock: under_lock.clone(),
-        events: events.clone(),
+    // Each event as it is emitted: was the mailbox's lock held?
+    let (under_lock, events) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let _watch = {
+        let (mailbox, under_lock, events) = (mailbox.clone(), under_lock.clone(), events.clone());
+        crate::test_support::watch(move |_| {
+            events.set(events.get() + 1);
+            if mailbox.state.try_lock().is_err() {
+                under_lock.set(under_lock.get() + 1);
+            }
+        })
     };
-    let _log = tracing::subscriber::set_default(tracing_subscriber::registry().with(probe));
 
     // Refusals for a full queue, at the disconnect, and while down: every path that logs.
     for _ in 0..MOMENTARY_CAP + 2 {
@@ -259,11 +246,11 @@ fn nothing_is_logged_under_the_mailbox_lock() {
     mailbox.connected();
 
     assert!(
-        events.load(Ordering::SeqCst) >= 4,
+        events.get() >= 4,
         "the mailbox logged nothing, so this test proves nothing"
     );
     assert_eq!(
-        under_lock.load(Ordering::SeqCst),
+        under_lock.get(),
         0,
         "the mailbox logged while holding its lock"
     );

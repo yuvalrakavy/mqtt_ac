@@ -1,8 +1,10 @@
 //! Test doubles shared by the bridge's tests.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -231,24 +233,61 @@ impl Record {
     }
 }
 
-/// The log events of this thread from `start` until it is dropped. A test using it runs on a
-/// current-thread runtime (the `#[tokio::test]` default), where every task it spawns runs on the
-/// test's thread too.
+/// Where this thread's log events go while a test watches them.
+type Sink = Rc<dyn Fn(Record)>;
+
+thread_local! {
+    static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+}
+
+/// The tests' recorder is the process's global subscriber, installed once; each test watches its
+/// own thread's events through it (`watch`). A subscriber per test (`set_default`) lost events:
+/// tracing caches each callsite's interest when the callsite is first hit, computed from the
+/// subscribers registered at that moment — while only one is, from the hitting thread's own — so
+/// a callsite first hit by another test's thread, as this test's subscriber was being registered,
+/// cached "never" for good, and this test never saw that event. With one global subscriber the
+/// cache can be stale only for a callsite hit while it was being installed: after a pause for any
+/// such registration to finish, the cache is rebuilt, as it is on every `watch`.
+fn install() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let recorder = tracing_subscriber::registry().with(Recorder);
+        let _ = tracing::subscriber::set_global_default(recorder);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    });
+    tracing_core::callsite::rebuild_interest_cache();
+}
+
+/// Hand every log event of this thread to `on_event`, as it is emitted, until the guard is
+/// dropped. A test using it runs on a current-thread runtime (the `#[tokio::test]` default), where
+/// every task it spawns runs on the test's thread too.
+pub fn watch(on_event: impl Fn(Record) + 'static) -> Watch {
+    install();
+    SINK.with(|sink| *sink.borrow_mut() = Some(Rc::new(on_event)));
+    Watch(())
+}
+
+/// Stops `watch` when dropped.
+pub struct Watch(());
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = SINK.try_with(|sink| sink.borrow_mut().take());
+    }
+}
+
+/// The log events of this thread from `start` until it is dropped (see `watch`).
 pub struct Capture {
     records: Arc<Mutex<Vec<Record>>>,
-    _default: tracing::subscriber::DefaultGuard,
+    _watch: Watch,
 }
 
 impl Capture {
     pub fn start() -> Capture {
         let records = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(Recorder {
-            records: records.clone(),
-        });
-        Capture {
-            records,
-            _default: tracing::subscriber::set_default(subscriber),
-        }
+        let sink = records.clone();
+        let _watch = watch(move |record| sink.lock().unwrap().push(record));
+        Capture { records, _watch }
     }
 
     /// Every event so far, in order.
@@ -273,16 +312,17 @@ impl Capture {
     }
 }
 
-struct Recorder {
-    records: Arc<Mutex<Vec<Record>>>,
-}
+struct Recorder;
 
 impl<S: Subscriber> Layer<S> for Recorder {
     fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        let Some(sink) = SINK.try_with(|sink| sink.borrow().clone()).ok().flatten() else {
+            return;
+        };
         let mut fields = Fields::default();
         event.record(&mut fields);
         let kind = fields.0.get("kind").cloned().unwrap_or_default();
-        self.records.lock().unwrap().push(Record {
+        sink(Record {
             level: *event.metadata().level(),
             kind,
             fields: fields.0,
