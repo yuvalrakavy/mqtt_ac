@@ -13,13 +13,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build
 
 # Build for local development (override the ARM default target)
-cargo build --target x86_64-apple-darwin
+cargo build --target aarch64-apple-darwin
+
+# Test on the Mac: an in-process fake broker and a stand-in Coolmaster on a local socket
+cargo test --target aarch64-apple-darwin
 
 # Check without building
 cargo check
 
 # Lint
-cargo clippy
+cargo clippy --target aarch64-apple-darwin --all-targets
 
 # Format
 cargo fmt
@@ -28,7 +31,12 @@ cargo fmt
 ./install_to_pi <pi_ip> <mqtt_broker> <controller_name> <coolmaster_ip>
 ```
 
-There are no tests in this project.
+The `#[ignore]`d tests in `coolmaster.rs` and `ac_unit.rs` talk to the real Coolmaster (10.0.1.70):
+run them by hand only, never in a gate. `--mqtt` takes `host` or `host:port` (default 1883).
+
+Every wait carries a `// WAIT: <row>` tag naming a row of `docs/wait-registry.md`, which
+`tests/wait_registry.rs` checks (Store's no-hang spec §13.3, §14). Negative controls for the
+no-hang tests: `docs/no-hang-3b-controls.toml`, run with Store's `scripts/negative-control.py`.
 
 ## Architecture
 
@@ -37,9 +45,10 @@ Three async worker tasks communicate via bounded `async-channel` channels (capac
 ```
 Polling Worker ──→ ToCoolmasterMessage channel ──→ Coolmaster Worker ←──→ TCP (port 10102)
 MQTT Subscriber ──→ ToCoolmasterMessage channel ──↗        │
-                                                    ToMqttPublisherMessage channel
-                                                            ↓
-                                                    MQTT Publisher ──→ MQTT Broker
+      ↑                                             ToMqttPublisherMessage channel
+  Pump (polls rumqttc; unbounded queue)                     ↓
+      ↑                                             MQTT Publisher ──→ MQTT Broker
+  MQTT Broker
 ```
 
 **Workers** (spawned in `service.rs` via `tokio::task::JoinSet`):
@@ -47,11 +56,22 @@ MQTT Subscriber ──→ ToCoolmasterMessage channel ──↗        │
 - **MQTT Worker** (`service.rs`): Manages MQTT connection lifecycle. Spawns publisher and subscriber as sub-tasks. Auto-reconnects on failure (10s retry).
 - **Polling Worker** (`polling.rs`): Sends `PublishUnitsState` every N seconds (default 4s).
 
+**The MQTT loop** (no-hang §14.3): rumqttc's request channel drains only while its event loop is
+polled, so the event loop is polled by `Pump` (`mqtt_pump.rs`), a task that waits on nothing else —
+it has no client and forwards CONNACKs and publishes on an unbounded queue (WARN
+`mqtt_backlog_high` past 1000 unread, INFO `mqtt_backlog_drained` back under 100). The subscriber
+session reads that queue and does the work: it announces (active flag, version, subscription) on
+every CONNACK, since rumqttc reconnects inside one event loop and the broker keeps no session, and
+it sends commands on to the Coolmaster worker. Nothing the pump forwards to can stop it polling.
+The pump also clears a rumqttc 0.25 packet-id collision left standing by a failed poll, which
+would otherwise stop the event loop taking requests for good.
+
 **Key modules:**
 - `ac_unit.rs` — `UnitState` model and Coolmaster response parsing (power, temp, fan speed, mode)
 - `messages.rs` — `ToCoolmasterMessage` and `ToMqttPublisherMessage` enums for inter-worker IPC
 - `mqtt_publisher.rs` — Publishes state changes as JSON; deduplicates (only publishes when state differs)
-- `mqtt_subscriber.rs` — Receives JSON commands from `Aircondition/Command/{name}` topic
+- `mqtt_subscriber.rs` — The MQTT session: receives JSON commands from `Aircondition/Command/{name}` topic (via the pump), announces on every CONNACK
+- `mqtt_pump.rs` — `Pump`: polls rumqttc's event loop in a task of its own; the forward queue's high-water flag (`Backlog`)
 - `error.rs` — `CoolmasterError` and `MqttError` types using `error-stack`
 
 **MQTT Topics:**

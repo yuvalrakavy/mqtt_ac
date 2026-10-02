@@ -5,8 +5,11 @@ mod ac_unit;
 mod coolmaster;
 mod service;
 mod mqtt_publisher;
+mod mqtt_pump;
 mod mqtt_subscriber;
 mod polling;
+#[cfg(test)]
+mod test_support;
 
 use rustop::opts;
 use service::ServiceConfig;
@@ -39,12 +42,18 @@ async fn main() {
         polling_period: tokio::time::Duration::from_secs(args.polling as u64),
     };
 
-    let service = service::Service::new(config);
-    let service = service.start().await;
+    let service = service::Service::new(config).start();
 
-    tokio::signal::ctrl_c().await.unwrap();
-    let _ = service.stop().await;
+    tokio::signal::ctrl_c().await.unwrap(); // WAIT: ctrl-c
+    // Stopping aborts the workers; the bound makes the whole shutdown finite whatever they do.
+    // WAIT: shutdown
+    if tokio::time::timeout(SHUTDOWN_GRACE, service.stop()).await.is_err() {
+        tracing::error!(kind = "shutdown_overrun", grace_ms = SHUTDOWN_GRACE.as_millis() as u64, "Workers did not stop after being aborted; exiting anyway");
+    }
 }
+
+/// How long the aborted workers get to end before the process exits regardless.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn get_version() -> String {
     format!("mqtt_ac: {} (built at {})", built_info::PKG_VERSION, built_info::BUILT_TIME_UTC)

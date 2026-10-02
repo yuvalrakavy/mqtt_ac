@@ -24,6 +24,11 @@ built = "0.8.0"
 [build-dependencies]
 built = { version= "0.8.0", features = ["chrono"] }
 
+[dev-dependencies]
+# The fleet's test tools, from the same repository as tracing-init (one revision for all three).
+wait-lint = { git="http://github.com/yuvalrakavy/tracing-init.git" }
+mqtt-test-broker = { git="http://github.com/yuvalrakavy/tracing-init.git" }
+
 # The otel feature was added at git rev 69ff434 (version 0.2.0).
 # Run `cargo update -p tracing-init` after first clone to refresh the lock file.
 

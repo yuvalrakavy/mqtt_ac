@@ -45,6 +45,7 @@ impl MqttPublisher {
         let into_context = || MqttError::Context("MQTT Publisher session".to_string());
 
         loop {
+            // WAIT: publisher-messages
             let message = self
                 .to_mqtt_publisher_channel
                 .recv()
@@ -72,6 +73,7 @@ impl MqttPublisher {
                     if let Some(tp) = tracing_init::traceparent::current() {
                         props.user_properties.push(("traceparent".into(), tp));
                     }
+                    // WAIT: mqtt-request
                     self.mqtt_client
                         .publish_with_properties(
                             topic,
@@ -97,6 +99,7 @@ impl MqttPublisher {
                     if let Some(tp) = tracing_init::traceparent::current() {
                         props.user_properties.push(("traceparent".into(), tp));
                     }
+                    // WAIT: mqtt-request
                     self.mqtt_client
                         .publish_with_properties(
                             topic,
@@ -140,6 +143,7 @@ impl MqttPublisher {
             props.user_properties.push(("traceparent".into(), tp));
         }
 
+        // WAIT: mqtt-request
         self.mqtt_client
             .publish_with_properties(
                 &topic,

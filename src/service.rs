@@ -42,7 +42,8 @@ impl Service {
         controller_name: &str,
     ) -> (AsyncClient, EventLoop) {
         let client_id = format!("Aircondition-{controller_name}");
-        let mut mqtt_options = MqttOptions::new(client_id, mqtt_broker, 1883);
+        let (host, port) = broker_host_port(mqtt_broker);
+        let mut mqtt_options = MqttOptions::new(client_id, host, port);
         let last_will_topic = format!("Aircondition/Active/{controller_name}");
         let last_will = LastWill::new(&last_will_topic, "false".as_bytes(), QoS::AtLeastOnce, true, None);
         mqtt_options
@@ -96,8 +97,8 @@ impl Service {
             }
         });
 
-        _ = sessions.join_next().await;
-        _ = sessions.shutdown().await;
+        _ = sessions.join_next().await; // WAIT: session-join
+        _ = sessions.shutdown().await; // WAIT: task-shutdown
     }
 
     async fn mqtt_worker(
@@ -125,7 +126,8 @@ impl Service {
 }
 
 impl Service<Stopped> {
-    pub async fn start(mut self) -> Service<Started> {
+    /// Spawns the workers on the current runtime; it waits on nothing.
+    pub fn start(mut self) -> Service<Started> {
         // Create the channels for the workers
         let (to_coolmaster_tx, to_coolmaster_rx) = async_channel::bounded(10);
         let (to_mqtt_publisher_tx, to_mqtt_publisher_rx) = async_channel::bounded(10);
@@ -175,7 +177,7 @@ impl Service<Stopped> {
 
 impl Service<Started> {
     pub async fn stop(mut self) -> Service<Stopped> {
-        self.workers.shutdown().await;
+        self.workers.shutdown().await; // WAIT: task-shutdown
         info!("Service stopped");
 
         Service {
@@ -185,3 +187,17 @@ impl Service<Started> {
         }
     }
 }
+
+/// `host` or `host:port` (default 1883).
+fn broker_host_port(broker: &str) -> (&str, u16) {
+    match broker.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => match port.parse() {
+            Ok(port) => (host, port),
+            Err(_) => (broker, 1883),
+        },
+        _ => (broker, 1883),
+    }
+}
+
+#[cfg(test)]
+mod tests;

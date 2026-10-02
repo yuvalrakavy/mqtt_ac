@@ -11,7 +11,7 @@ pub async fn polling_worker(
     loop {
         debug!("Polling coolmaster");
         let message = ToCoolmasterMessage::PublishUnitsState;
-        if to_coolmaster_channel.send(message).await.is_err() {
+        if to_coolmaster_channel.send(message).await.is_err() { // WAIT: coolmaster-queue
             info!("Coolmaster channel closed, exiting polling worker");
             return;
         }
