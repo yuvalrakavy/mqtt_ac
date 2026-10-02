@@ -424,7 +424,9 @@ async fn a_reset_filter_while_the_coolmaster_is_down_is_refused_with_an_error() 
 /// sends again the retained state it knows.
 ///
 /// The broker withholds its acks and takes two QoS 1 publishes in flight, so the unit's state from
-/// the start-up listing is still waiting in rumqttc when the connection drops.
+/// the start-up listing is still waiting in rumqttc when the connection drops. (Sometimes only one
+/// is taken: a subscription takes a packet id too, and a publish whose id collides with the held
+/// one stops rumqttc taking requests. Either way the state is still waiting — which is checked.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_state_a_reconnect_dropped_is_published_again() {
     let broker = FakeBroker::start_with_receive_max(2).await;
@@ -435,9 +437,9 @@ async fn a_state_a_reconnect_dropped_is_published_again() {
 
     assert!(
         broker
-            .wait_until(Duration::from_secs(10), |b| b.held_acks() >= 2)
+            .wait_until(Duration::from_secs(10), |b| b.held_acks() >= 1)
             .await,
-        "the bridge never filled its in-flight window"
+        "the broker never held an ack"
     );
     assert!(
         wait_for(Duration::from_secs(10), || coolmaster
