@@ -24,12 +24,15 @@ async fn main() {
         opt polling: u16=4, desc: "Polling period (in seconds)";
     }.parse_or_exit();
 
+    // Keep the guard for all of main: dropping it shuts down tracing-init's OpenTelemetry providers
+    // (guard.rs), so spans and OTLP logs would stop right after startup.
     let d = tracing_init::TracingInit::builder("mqtt_ac")
         .log_to_file(true)
         .log_to_gelf_server(true)
         .file_prefix("ac")
         .file_path("logs")
-        .init().map(|t| format!("{t}")).unwrap();
+        .init()
+        .unwrap();
 
     println!("Logging: {d}");
 
