@@ -112,13 +112,19 @@ async fn sigint_stops_the_bridge_cleanly() {
 
 /// The whole process stops within its bound, whatever a blocking thread is doing (re-review C6,
 /// the fleet's F1 and F3). The bridge's file-system work is tracing-init's: it reads its logging
-/// configuration and opens today's log file, synchronously. Here that log file is a FIFO nobody
-/// reads, so opening it for writing never returns — as on a stalled file system. SIGTERM must
-/// still stop the bridge, cleanly and promptly: the stop signals are taken before anything else,
-/// the logging starts off the runtime's workers, and the runtime is shut down with a bound instead
-/// of dropped (dropping it waits for every blocking thread: here for good, and for a DNS lookup of
-/// the broker's or the Coolmaster's name as long as the resolver takes). With the signals taken
-/// after the logging start, SIGTERM kills the stalled bridge instead.
+/// configuration and opens today's log file. Here that log file is a FIFO nobody reads, so
+/// opening it for writing never returns — as on a stalled file system. tracing-init gives that
+/// open 5 s and then starts without the file (`log_destination_skipped`, since 97eebba), so the
+/// logging start ends by itself about 5 s in; SIGTERM, sent 1 s in, must stop the bridge cleanly
+/// well before that:
+/// - the stop signals are taken before the logging starts — taken after it, SIGTERM kills the
+///   stalled bridge (signal 15);
+/// - the start is raced against the stop — not raced, the bridge waits out the start, about 4 s;
+/// - the runtime is shut down within its 1 s grace, abandoning the blocking thread still in the
+///   start — dropped, it waits for that thread, about 4 s (and, in production, for a DNS lookup of
+///   the broker's or the Coolmaster's name as long as the resolver takes).
+///
+/// So the bridge must exit, cleanly, within 2.5 s of SIGTERM.
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_during_a_stalled_logging_start_stops_the_bridge_within_its_bound() {
     let broker = FakeBroker::start().await;
@@ -144,8 +150,9 @@ async fn sigterm_during_a_stalled_logging_start_stops_the_bridge_within_its_boun
         .spawn()
         .expect("start the bridge");
 
-    // Time to start and reach the read that never returns.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Time to start, take the stop signals and reach the open that does not return; well inside
+    // tracing-init's 5 s bound on it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let pid = bridge.id().expect("the bridge's pid").to_string();
     let sent = std::process::Command::new("kill").args(["-TERM", &pid]).status();
     assert!(sent.is_ok_and(|s| s.success()), "could not send SIGTERM to the bridge");
@@ -160,7 +167,7 @@ async fn sigterm_during_a_stalled_logging_start_stops_the_bridge_within_its_boun
     };
     let took = started.elapsed();
     assert!(
-        status.success() && took < Duration::from_secs(10),
+        status.success() && took < Duration::from_millis(2500),
         "the bridge did not stop cleanly within its bound on SIGTERM while its logging start was stalled: {status} \
          after {took:?}"
     );

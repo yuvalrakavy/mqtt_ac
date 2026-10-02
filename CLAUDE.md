@@ -85,8 +85,9 @@ broker outage is one episode however many sessions it spans: INFO `connection_lo
 connection has lasted 5 s — one lost sooner is another failed attempt of the same outage. SIGINT
 and SIGTERM are taken first thing, before the logging starts (on a blocking thread, raced against
 them), and both run the bounded shutdown (5 s; past it, WARN `shutdown_timeout`); `main` then shuts
-the runtime down within 2 s, abandoning any thread still in a synchronous call (a DNS lookup,
-tracing-init's start on a stalled file system) instead of waiting for it.
+the runtime down within 1 s, abandoning any thread still in a synchronous call (a DNS lookup,
+tracing-init's start on a stalled file system, which tracing-init bounds at 5 s per destination)
+instead of waiting for it.
 
 **Key modules:**
 - `ac_unit.rs` — `UnitState` model and Coolmaster response parsing (power, temp, fan speed, mode)
@@ -128,7 +129,6 @@ Kinds this bridge emits: broker — `connection_lost` (INFO), `external_failure`
 
 - **The error topic is retained** (`Aircondition/Error/{controller}` is published with retain), though the house topic rules never retain `Error`. It changes with the topic-grammar migration of this bridge and its SDL driver, together.
 - **No explicit `Active=false` or DISCONNECT at shutdown.** The bounded shutdown aborts the workers, and the connection closes without a DISCONNECT, so the broker publishes the last will (`Active=false`, retained). A clean DISCONNECT would suppress the will and need an explicit `Active=false` publish first.
-- **A log file that stops taking writes stalls the bridge.** tracing-init writes its file log synchronously on whatever thread logs (its non-blocking writer is a TODO there), so once the file is open, a stalled file system holds the next log line — on a worker, or in the shutdown itself — and no bound in this bridge covers it. The start is covered: opening the file runs off the workers and a stop ends it. The fix belongs in tracing-init.
 
 This bridge joins distributed traces via MQTT v5 `traceparent` user properties:
 - **Inbound**: `traceparent` user property extracted from each Publish packet; span created with `tracing_init::traceparent::set_remote_parent` before entering

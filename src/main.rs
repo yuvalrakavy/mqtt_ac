@@ -49,16 +49,16 @@ fn main() -> ExitCode {
     // WAIT: runtime
     let exit = runtime.block_on(run(config));
     // The runtime is shut down with a bound, never dropped (re-review C6, the fleet's F1):
-    // dropping it waits, without limit, for every thread still in a synchronous call — a DNS
-    // lookup of the broker's or the Coolmaster's name (tokio and rumqttc resolve names on blocking
-    // threads), tracing-init's start on a stalled file system. Past the bound they are abandoned,
-    // and the process exits.
+    // dropping it waits for every thread still in a synchronous call — a DNS lookup of the
+    // broker's or the Coolmaster's name (tokio and rumqttc resolve names on blocking threads),
+    // without limit; tracing-init's start on a stalled file system, up to its own bound (5 s per
+    // destination). Past the grace they are abandoned, and the process exits.
     shut_down(runtime);
     exit
 }
 
 /// How long the runtime's threads get, once `run` has returned, before the process exits anyway.
-const RUNTIME_GRACE: Duration = Duration::from_secs(2);
+const RUNTIME_GRACE: Duration = Duration::from_secs(1);
 
 /// Shut the runtime down within `RUNTIME_GRACE`, whatever its threads are doing.
 fn shut_down(runtime: tokio::runtime::Runtime) {
@@ -75,9 +75,11 @@ async fn run(config: ServiceConfig) -> ExitCode {
     // is logged once the logging has started.
     let mut signals = StopSignals::register();
 
-    // tracing-init's start reads its configuration and opens today's log file, synchronously: on a
-    // blocking thread, raced against a stop, so a stalled file system holds the start, never the
-    // stop (F1). The thread, if it never returns, is abandoned by `shut_down`.
+    // tracing-init's start reads its configuration, opens today's log file and resolves the GELF
+    // host, synchronously; it bounds the open and the lookup at 5 s each, then starts without
+    // that destination. On a blocking thread, raced against a stop, so a stalled file system or
+    // name lookup holds the start, never the stop (F1). The thread, if still in the start, is
+    // abandoned by `shut_down`.
     let starting = tokio::task::spawn_blocking(start_logging);
     let logging = match &mut signals {
         Ok(signals) => {
