@@ -9,7 +9,15 @@
 # were dropped silently; SIGTERM killed the bridge. Round 2's, on 9810935: a command answered
 # with something unusable spun connect-apply-fail; a Coolmaster closing on every command was
 # reconnected to at once; an outage's error was published on every retry; a rejection was logged
-# as `external_failure`.)
+# as `external_failure`. Round 3's (the re-review, C1-C9), on 1f67f88: with the broker stalled a
+# command never reached the Coolmaster; a report cut short by the end of its session was
+# republished stale (L1.002 at 20, not 21); a setpoint superseded during the catch-up was applied
+# (on, temp 20, ls2, temp 22); the Coolmaster flag said true for a Coolmaster that answered nothing,
+# and still said true 2 s after the connection was lost; a broker dropping every connection was
+# logged as 4 outages with no WARN; a multibyte temperature panicked the parser; a worker's panic
+# left the bridge running (against a stub of the old `serve`); SIGTERM during a stalled logging
+# start killed the process (signal 15). C8's test passed there: it closes a test gap, and its
+# control is what shows it.)
 #
 # The stand-in Coolmaster serves at most a few connections in the reconnect-loop tests, so a
 # mutant that spins is caught after a dozen connections, not thousands: uncapped, one spun 16,282
@@ -132,8 +140,8 @@ guard       = "poll_is_a_wait"
 [[control]]
 name        = "a_collision_is_undeclared"
 file        = "docs/wait-registry.md"
-anchor      = '''local-methods = connect_to, handle_message, catch_up, lost'''
-replacement = '''local-methods = handle_message, catch_up, lost'''
+anchor      = '''local-methods = connect_to, handle_message, catch_up'''
+replacement = '''local-methods = handle_message, catch_up'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "wait_registry"]
 expect_text = "`.connect_to(..).await` on a receiver other than `self`"
@@ -200,7 +208,7 @@ guard       = "read_dropped_while_down"
 [[control]]
 name        = "the_observed_state_is_not_read_on_return"
 file        = "src/coolmaster.rs"
-anchor      = '''        if let Err(e) = self.handle_message(&list, publisher).await {'''
+anchor      = '''        if let Err(e) = self.handle_message(&list, reports).await {'''
 replacement = '''        if let Err(e) = Ok::<(), Report<CoolmasterError>>(()) {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "state_set_while_the_coolmaster_is_down"]
@@ -212,8 +220,8 @@ guard       = "observed_state_on_return"
 [[control]]
 name        = "an_unusable_listing_is_a_lost_connection"
 file        = "src/coolmaster.rs"
-anchor      = '''            if command_failed(&list, &e, publisher).await {'''
-replacement = '''            if command_failed(&list, &e, publisher).await || true {'''
+anchor      = '''            if command_failed(&list, &e, reports) {'''
+replacement = '''            if command_failed(&list, &e, reports) || true {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_listing_the_bridge_cannot_use"]
 expect_text = "was taken for a lost connection"
@@ -373,3 +381,151 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--", "a_command_the_coolmaster_rejects"]
 expect_text = "was not one WARN `command_rejected`"
 guard       = "command_rejected_kind"
+
+# Round 3 (re-review C1): the Coolmaster worker waits until the publisher has taken its report —
+# the shape of the bounded queue it used to send on. With the broker stalled the publisher takes
+# nothing, and the worker takes no command.
+[[control]]
+name        = "the_worker_waits_for_the_publisher"
+file        = "src/coolmaster.rs"
+anchor      = '''                reports.observed(units_state);'''
+replacement = '''                reports.observed(units_state);
+                while reports.untaken() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "the_coolmaster_worker_takes_commands_while_the_broker_is_stalled"]
+expect_text = "a command never reached the Coolmaster"
+guard       = "worker_never_waits_on_mqtt"
+
+# Round 3 (C2): a report does not update what the bridge knows of a unit already known, so the
+# republish after a CONNACK sends a superseded state.
+[[control]]
+name        = "a_report_does_not_update_the_model"
+file        = "src/reports.rs"
+anchor      = '''                state.units.insert(unit_state.unit.clone(), unit_state);'''
+replacement = '''                state.units.entry(unit_state.unit.clone()).or_insert(unit_state);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "a_report_cut_short"]
+expect_text = "published an older state than the last it was given"
+guard       = "model_folded_on_report"
+
+# Round 3 (C3): the catch-up takes every held state out of the mailbox at once, as it did, so a
+# value set meanwhile no longer replaces its held one.
+[[control]]
+name        = "the_held_state_is_taken_all_at_once"
+file        = "src/coolmaster.rs"
+anchor      = '''        while let Some(command) = mailbox.take_held() {'''
+replacement = '''        let held: Vec<_> = std::iter::from_fn(|| mailbox.take_held()).collect();
+        for command in held {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "a_value_set_during_the_catch_up"]
+expect_text = "superseded during the catch-up was applied anyway"
+guard       = "held_state_taken_one_at_a_time"
+
+# Round 3 (C4): the Coolmaster flag says true on the connect, before the Coolmaster has answered.
+[[control]]
+name        = "the_flag_says_true_on_the_connect"
+file        = "src/coolmaster.rs"
+anchor      = '''            let refused = mailbox.connected();'''
+replacement = '''            let refused = mailbox.connected();
+            reports.coolmaster_connected(true);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "the_coolmaster_flag_says_true_only_once"]
+expect_text = "said true for a Coolmaster that took each connection"
+guard       = "flag_true_on_proof_of_life"
+
+# Round 3 (C4): a lost connection does not say false at once.
+[[control]]
+name        = "a_lost_connection_does_not_say_false"
+file        = "src/coolmaster.rs"
+anchor      = '''        self.stream = None;
+        reports.coolmaster_connected(false);'''
+replacement = '''        self.stream = None;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "the_coolmaster_flag_says_false_as_soon"]
+expect_text = "2 s later its flag still said true"
+guard       = "flag_false_at_once_on_loss"
+
+# Round 3 (C5): the temperature's unit sliced off by bytes, as it was: a multibyte one panics.
+[[control]]
+name        = "a_multibyte_temperature_panics"
+file        = "src/ac_unit.rs"
+anchor      = '''        let value = chars.as_str().parse::<f32>().map_err(|_| invalid())?;'''
+replacement = '''        let value = temperature[0..temperature.len() - 1].parse::<f32>().map_err(|_| invalid())?;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "a_temperature_ending_in_a_multibyte"]
+expect_text = "it panicked"
+guard       = "temperature_parse_never_panics"
+
+# Round 3 (C5): nobody watches the workers: a dead one leaves the bridge running without it.
+[[control]]
+name        = "a_dead_worker_goes_unnoticed"
+file        = "src/main.rs"
+anchor      = '''        (worker, cause) = service.worker_ended() => {'''
+replacement = '''        (worker, cause) = std::future::pending::<(&'static str, String)>() => {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "a_worker_that_dies"]
+expect_text = "a worker died, and the bridge went on without it"
+guard       = "dead_worker_ends_the_bridge"
+
+# Round 3 (C6, F1): the runtime dropped at the end of `main`, as `#[tokio::main]` does: it waits
+# for the stalled blocking thread for good.
+[[control]]
+name        = "the_runtime_is_dropped"
+file        = "src/main.rs"
+anchor      = '''    runtime.shutdown_timeout(RUNTIME_GRACE);'''
+replacement = '''    drop(runtime);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "stalled"]
+expect_text = "did not exit within 15 s of SIGTERM while its logging start was stalled"
+guard       = "runtime_shutdown_bounded"
+
+# Round 3 (F1, F3): a stop does not end a stalled logging start; the signals are taken, so SIGTERM
+# no longer kills the process, and nothing stops it.
+[[control]]
+name        = "a_stop_does_not_end_a_stalled_start"
+file        = "src/main.rs"
+anchor      = '''                started = starting => started,
+                signal = signals.next() => {'''
+replacement = '''                started = starting => started,
+                signal = std::future::pending::<&'static str>() => {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "signals", "--", "stalled"]
+expect_text = "did not exit within 15 s of SIGTERM while its logging start was stalled"
+guard       = "stop_ends_a_stalled_start"
+
+# Round 3 (C8): the catch-up's state in flight when its connection fails is not put back.
+[[control]]
+name        = "the_catch_up_loses_its_state_in_flight"
+file        = "src/coolmaster.rs"
+anchor      = '''                        mailbox.restore(vec![command]);
+                        return Err(e);'''
+replacement = '''                        return Err(e);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "a_connection_lost_during_the_catch_up"]
+expect_text = "were not all applied on the next connection"
+guard       = "catch_up_restores_in_flight"
+
+# Round 3 (C9, F2): the broker's outage ends on the first reply after a CONNACK, not once the
+# connection has lasted: a broker that drops every connection logs an INFO pair per connection.
+[[control]]
+name        = "the_outage_ends_on_any_reply"
+file        = "src/mqtt_pump.rs"
+anchor      = '''        if connected_at == 0 || self.stamp().saturating_sub(connected_at) < STABLE_AFTER.as_millis() as u64 {'''
+replacement = '''        if connected_at == 0 {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "a_broker_that_drops_every_connection"]
+expect_text = "outages, not one"
+guard       = "broker_recovery_on_proof_of_life"
+
+# Round 3 (C1): the worker's error queue grows without a cap.
+[[control]]
+name        = "the_error_queue_is_unbounded"
+file        = "src/reports.rs"
+anchor      = '''            if state.errors.len() > ERROR_CAP {'''
+replacement = '''            if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--bin", "mqtt_ac", "--", "errors_past_the_cap"]
+expect_text = "the error queue grew past its cap"
+guard       = "error_queue_capped"
