@@ -31,6 +31,9 @@ use crate::protocol;
 /// `ResetFilter`, and v1's timing — a connect and its prompt within 10 s, a retry every 5 s, one
 /// WARN past 30 s down, a listing every 4 s. v1 bounded each exchange at 10 s; the runtime bounds
 /// each operation, an `apply`'s few exchanges together, which a CoolMaster answers in milliseconds.
+/// Anything else the runtime adds to `DriverInfo` keeps its default.
+// Every field is named today; the update keeps it so when the runtime adds one (`restore`).
+#[allow(clippy::needless_update)]
 pub fn info() -> DriverInfo {
     DriverInfo {
         writes: Writes::Acknowledged,
@@ -44,6 +47,7 @@ pub fn info() -> DriverInfo {
             poll: Some(Duration::from_secs(4)),
             ..Timing::default()
         },
+        ..DriverInfo::default()
     }
 }
 
@@ -84,11 +88,29 @@ pub struct Coolmaster {
     report: Option<Reporter>,
     /// The units whose listing line cannot be used now, as last said.
     passed_over: BTreeSet<String>,
+    /// The units the last full listing named, usable or not; `None` before the first.
+    listed: Option<BTreeSet<String>>,
 }
 
 impl Coolmaster {
     pub fn new(address: Address) -> Coolmaster {
-        Coolmaster { address, link: None, dropped: None, report: None, passed_over: BTreeSet::new() }
+        Coolmaster { address, link: None, dropped: None, report: None, passed_over: BTreeSet::new(), listed: None }
+    }
+
+    /// A full listing: the units the last one named and this one does not — gone from the
+    /// CoolMaster (unbound, or the controller set up again). A unit listed garbled is still there.
+    fn gone(&mut self, listing: &protocol::Listing) -> Vec<String> {
+        let now: BTreeSet<String> =
+            listing.states.iter().map(|s| s.target.clone()).chain(listing.bad.iter().map(|b| b.unit.clone())).collect();
+        let gone: Vec<String> = match &self.listed {
+            Some(before) => before.difference(&now).cloned().collect(),
+            None => Vec::new(),
+        };
+        for unit in &gone {
+            self.passed_over.remove(unit);
+        }
+        self.listed = Some(now);
+        gone
     }
 
     /// Say which units a listing passed over: an INFO when a unit's line first cannot be used,
@@ -137,6 +159,21 @@ impl Coolmaster {
             return Err(OpError::Link(LinkError::new("the CoolMaster closed the connection")));
         }
         Ok(reply)
+    }
+
+    /// A momentary command: `ResetFilter` (`filt <unit>`), then the unit read back. It names a
+    /// unit — `filt` with none would reset every unit's filter.
+    async fn command(&mut self, unit: Option<&str>, call: &CommandCall) -> Result<Option<Value>, OpError> {
+        if call.command != protocol::RESET_FILTER {
+            return Err(OpError::Unsupported(format!("the CoolMaster has no command `{}`", call.command)));
+        }
+        let Some(unit) = unit else {
+            return Err(OpError::Rejected(format!("`{}` names the unit it resets", protocol::RESET_FILTER)));
+        };
+        let command = protocol::reset_filter(unit)?;
+        self.exchange(&command).await?;
+        self.read_back(unit).await;
+        Ok(None)
     }
 
     /// After a command: read the unit back, so its `State` follows at once rather than at the next
@@ -225,6 +262,13 @@ impl DeviceDriver for Coolmaster {
         let body = self.exchange(&command).await?;
         let listing = protocol::parse_listing(&body);
         self.note(&listing);
+        if unit.is_none() {
+            for unit in self.gone(&listing) {
+                info!(unit = %unit, "A unit is no longer listed by the CoolMaster");
+                // TODO(remove): retract the unit's retained State — `report.remove(&unit)` — once
+                // the runtime's `Reporter::remove` lands; until then it stays as last read.
+            }
+        }
         listing.into_states()
     }
 
@@ -258,13 +302,8 @@ impl DeviceDriver for Coolmaster {
 
     /// `ResetFilter` (`filt <unit>`), then the unit read back.
     async fn execute(&mut self, target: &str, call: &CommandCall) -> Result<Option<Value>, OpError> {
-        if call.command != protocol::RESET_FILTER {
-            return Err(OpError::Unsupported(format!("the CoolMaster has no command `{}`", call.command)));
-        }
-        let command = protocol::reset_filter(target)?;
-        self.exchange(&command).await?;
-        self.read_back(target).await;
-        Ok(None)
+        // The runtime passes "" for a command with no target (its `Option<&str>` is coming).
+        self.command(Some(target).filter(|t| !t.is_empty()), call).await
     }
 
     /// The CoolMaster needs no setup per unit; a `Config`'s `feedback` is the runtime's.
@@ -284,6 +323,33 @@ mod tests {
         assert_eq!(Address::parse("coolmaster.local:1"), Ok(Address { host: "coolmaster.local".into(), port: 1 }));
         for bad in ["", ":10102", "host:", "host:port", "host:99999"] {
             assert!(Address::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A unit a full listing no longer names is gone; one listed garbled is not, and the first
+    /// listing has nothing to compare with.
+    #[test]
+    fn a_unit_the_listing_no_longer_names_is_gone() {
+        let mut driver = Coolmaster::new(Address::parse("127.0.0.1").unwrap());
+        let listing = |body: &str| protocol::parse_listing(body);
+        let both = "L7.400 ON 22.0C 25.0C High Cool OK - 0\r\nL7.401 OFF 22.0C 25.0C High Cool OK - 0";
+        assert!(driver.gone(&listing(both)).is_empty());
+        assert!(driver.gone(&listing("L7.400 ON 22.0C 25.0C High Cool OK - 0\r\nL7.401 ON ??? garbled")).is_empty());
+        assert_eq!(driver.gone(&listing("L7.400 ON 22.0C 25.0C High Cool OK - 0")), ["L7.401"]);
+        assert!(driver.gone(&listing("L7.400 ON 22.0C 25.0C High Cool OK - 0")).is_empty());
+        assert_eq!(driver.gone(&listing("")), ["L7.400"]);
+    }
+
+    /// A unit address is the target as the CoolMaster lists it — `L7.400` unchanged, never a `/`,
+    /// `+` or `#` (the runtime drops a target holding one).
+    #[test]
+    fn a_unit_address_is_the_target_unchanged() {
+        let states = protocol::parse_listing("L7.400 ON 22.0C 25.0C High Cool OK - 0").into_states().unwrap();
+        assert_eq!(states[0].target, "L7.400");
+        assert_eq!(states[0].values["unit"], "L7.400");
+        for bad in ["L7/400 ON 22.0C 25.0C High Cool OK - 0", "L7+400 ON 22.0C 25.0C High Cool OK - 0", "# ON 22.0C 25.0C High Cool OK - 0"]
+        {
+            assert!(protocol::parse_listing(bad).into_states().is_err(), "{bad}");
         }
     }
 
