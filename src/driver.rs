@@ -254,7 +254,8 @@ impl DeviceDriver for Coolmaster {
     }
 
     /// `ls2`: every unit (`Scope::All`, and `Scope::Any`), or one. A line that cannot be used costs
-    /// only its own unit; a listing with no usable line is `Unusable`.
+    /// only its own unit; a listing with no usable line is `Unusable`. A unit a full listing no
+    /// longer names has its retained `State` retracted, so the broker keeps no ghost of it.
     async fn read_state(&mut self, scope: Scope) -> Result<Vec<TargetState>, OpError> {
         let unit = match &scope {
             Scope::Target(unit) => Some(unit.as_str()),
@@ -266,9 +267,10 @@ impl DeviceDriver for Coolmaster {
         self.note(&listing);
         if unit.is_none() {
             for unit in self.gone(&listing) {
-                info!(unit = %unit, "A unit is no longer listed by the CoolMaster");
-                // TODO(remove): retract the unit's retained State — `report.remove(&unit)` — once
-                // the runtime's `Reporter::remove` lands; until then it stays as last read.
+                info!(unit = %unit, "A unit is no longer listed by the CoolMaster; its State is retracted");
+                if let Some(report) = &self.report {
+                    report.remove(&unit);
+                }
             }
         }
         listing.into_states()

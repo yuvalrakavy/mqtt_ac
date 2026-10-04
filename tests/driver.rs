@@ -259,3 +259,30 @@ async fn a_unit_in_failure_keeps_its_state_current() {
     );
     assert!(h.stop().await);
 }
+
+/// A unit the CoolMaster no longer lists (unbound at the controller) has its retained `State`
+/// retracted — an empty retained payload — so the broker keeps no ghost of it; listed again, it is
+/// published again. The other unit is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unit_gone_from_the_listing_has_its_state_retracted() {
+    let h = Harness::start_with("gone", quick(Some(Duration::from_millis(200)))).await;
+    assert!(h.connected().await);
+    let topic = h.topics.state("L1.002");
+    assert!(h.broker.retained_on(&topic).is_some_and(|p| !p.is_empty()));
+    let unit = h.coolmaster.remove_unit("L1.002").expect("the stand-in's L1.002");
+    let retracted = h.eventually(BOUND, |h| h.broker.received_on(&topic).last().is_some_and(|r| r.payload.is_empty() && r.retain)).await;
+    assert!(
+        retracted && h.broker.retained_on(&topic).is_none(),
+        "the State of a unit gone from the listing was not retracted: {:?}; retained: {:?}",
+        h.broker.received_on(&topic).last(),
+        h.broker.retained_on(&topic)
+    );
+    assert!(h.broker.retained_on(&h.topics.state("L1.001")).is_some_and(|p| !p.is_empty()), "the unit still listed lost its State");
+    h.coolmaster.add_unit("L1.002", unit);
+    assert!(
+        h.eventually(BOUND, |h| h.broker.retained_on(&topic).is_some_and(|p| !p.is_empty())).await,
+        "a unit listed again was not published again: {:?}",
+        h.broker.received_on(&topic).last()
+    );
+    assert!(h.stop().await);
+}

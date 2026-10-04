@@ -158,6 +158,16 @@ impl FakeCoolmaster {
         }
     }
 
+    /// Take a unit off the CoolMaster's list (unbound at the controller); its state, to put back.
+    pub fn remove_unit(&self, unit: &str) -> Option<Unit> {
+        self.shared.units.lock().unwrap().remove(unit)
+    }
+
+    /// Put a unit on the CoolMaster's list.
+    pub fn add_unit(&self, unit: &str, state: Unit) {
+        self.shared.units.lock().unwrap().insert(unit.to_owned(), state);
+    }
+
     /// Every command the CoolMaster has received, in order.
     pub fn commands(&self) -> Vec<String> {
         self.shared.commands.lock().unwrap().clone()

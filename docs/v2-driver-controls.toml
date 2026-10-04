@@ -162,6 +162,17 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--tes
 expect_text = '''the unit's State did not follow'''
 guard       = "read_back_after_a_command"
 
+# A unit gone from the listing left as last read: its retained State stays at the broker, a ghost.
+[[control]]
+name        = "a_gone_unit_keeps_its_state"
+file        = "src/driver.rs"
+anchor      = '''                    report.remove(&unit);'''
+replacement = '''                    let _ = (report, &unit);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_gone_from_the_listing_has_its_state_retracted", "--exact"]
+expect_text = '''the State of a unit gone from the listing was not retracted'''
+guard       = "gone_unit_retracted"
+
 # A wait with no tag: the registry test is wired to the driver's source.
 [[control]]
 name        = "a_wait_loses_its_tag"
