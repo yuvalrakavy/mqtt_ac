@@ -104,6 +104,28 @@ fn a_line_that_does_not_parse_says_why() {
     }
 }
 
+/// A listing is read a line at a time: one bad line costs only its own unit, and says which and
+/// why (v1 failed the whole listing on it, so no unit's State changed).
+#[test]
+fn one_bad_line_costs_only_its_own_unit() {
+    let body = "L1.001 ON 22.0C 25.0C High Cool OK - 0\r\nL1.002 ON 24.0C ??? Low Heat OK # 1\r\n\r\nL1.003 OFF 20.0C 21.0C Auto Dry 7 - 0";
+    let listing = parse_listing(body);
+    let units: Vec<&str> = listing.states.iter().map(|s| s.target.as_str()).collect();
+    assert_eq!(units, ["L1.001", "L1.003"]);
+    assert_eq!(listing.bad.len(), 1, "{:?}", listing.bad);
+    assert_eq!((listing.bad[0].unit.as_str(), listing.bad[0].line.as_str()), ("L1.002", "L1.002 ON 24.0C ??? Low Heat OK # 1"));
+    assert!(listing.bad[0].why.contains("???"), "{:?}", listing.bad[0]);
+    assert_eq!(listing.into_states().map(|s| s.len()), Ok(2));
+}
+
+/// A listing with no usable line is `Unusable`; an empty one is no units.
+#[test]
+fn a_listing_with_no_usable_line_is_unusable() {
+    assert!(matches!(parse_listing("garbage\r\nL1.001 ON").into_states(), Err(OpError::Unusable(_))));
+    assert_eq!(parse_listing("").into_states(), Ok(Vec::new()));
+    assert_eq!(parse_listing("\r\n").into_states(), Ok(Vec::new()));
+}
+
 /// The commands, formatted as v1 sent them.
 #[test]
 fn each_property_is_its_command() {

@@ -147,13 +147,49 @@ pub fn parse_line(line: &str) -> Result<TargetState, String> {
     Ok(TargetState::new(unit, values))
 }
 
-/// An `ls2` listing's body: a State document for each line.
-pub fn parse_listing(body: &str) -> Result<Vec<TargetState>, OpError> {
-    body.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| parse_line(line).map_err(|why| OpError::Unusable(format!("an ls2 line that cannot be used (`{line}`: {why})"))))
-        .collect()
+/// A listing line that cannot be used, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadLine {
+    /// Its first word — the unit, if anything is — or, with none, the line.
+    pub unit: String,
+    pub line: String,
+    pub why: String,
+}
+
+/// An `ls2` listing, line by line: the units whose lines parse, and the lines that do not.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Listing {
+    pub states: Vec<TargetState>,
+    pub bad: Vec<BadLine>,
+}
+
+impl Listing {
+    /// The units' State documents. A listing none of whose lines can be used is `Unusable`; one
+    /// with some is the units that can (an empty listing is no units).
+    pub fn into_states(self) -> Result<Vec<TargetState>, OpError> {
+        match self.bad.first() {
+            Some(bad) if self.states.is_empty() => {
+                Err(OpError::Unusable(format!("no line of the listing can be used (`{}`: {})", bad.line, bad.why)))
+            }
+            _ => Ok(self.states),
+        }
+    }
+}
+
+/// An `ls2` listing's body, a line at a time: one bad line costs only its own unit. (v1 failed the
+/// whole listing on it, so no unit's State changed while one unit was listed garbled.)
+pub fn parse_listing(body: &str) -> Listing {
+    let mut listing = Listing::default();
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        match parse_line(line) {
+            Ok(state) => listing.states.push(state),
+            Err(why) => {
+                let unit = line.split_whitespace().next().unwrap_or(line).to_owned();
+                listing.bad.push(BadLine { unit, line: line.to_owned(), why });
+            }
+        }
+    }
+    listing
 }
 
 /// The listing command: every unit, or one.

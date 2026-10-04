@@ -178,3 +178,30 @@ async fn a_request_held_through_a_lost_link_is_applied_on_recovery() {
     assert!(h.coolmaster.served() <= 3, "the bridge reconnected {} times for one outage", h.coolmaster.served());
     assert!(h.stop().await);
 }
+
+/// One `ls2` line the bridge cannot use — a unit the CoolMaster lists garbled — is passed over: the
+/// other units' `State` is published from the first listing on, and a poll still carries their
+/// changes. v1 failed the whole listing on one bad line, so no unit's `State` changed at all. The
+/// bad line is no reason to reconnect either.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_bad_ls2_line_does_not_fail_the_listing() {
+    let h = Harness::start_prepared("badline", quick(Some(Duration::from_millis(200))), |coolmaster| {
+        coolmaster.set_line("L1.002", Some("L1.002 ON 24.0C ??? Low Heat OK # 1"));
+    })
+    .await;
+    assert!(
+        h.eventually(BOUND, |h| h.status().as_deref() == Some("connected") && h.state("L1.001").is_some()).await,
+        "L1.001's State was never published beside a bad line for L1.002: {:?}; the commands: {:?}",
+        h.state("L1.001"),
+        h.coolmaster.commands()
+    );
+    h.coolmaster.change("L1.001", |unit| unit.power = true);
+    assert!(
+        h.eventually(BOUND, |h| h.state("L1.001").is_some_and(|s| s["power"] == true)).await,
+        "a poll beside a bad line did not carry L1.001's change: {:?}",
+        h.state("L1.001")
+    );
+    assert!(h.state("L1.002").is_none(), "a line that cannot be used was published: {:?}", h.state("L1.002"));
+    assert_eq!(h.coolmaster.served(), 1, "a bad line was taken for a lost link: the bridge reconnected");
+    assert!(h.stop().await);
+}

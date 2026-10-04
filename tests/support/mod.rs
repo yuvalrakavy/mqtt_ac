@@ -83,9 +83,15 @@ impl Harness {
     }
 
     pub async fn start_with(instance: &str, timing: TimingOverrides) -> Harness {
+        Harness::start_prepared(instance, timing, |_| {}).await
+    }
+
+    /// The same, after `prepare` has set the CoolMaster up for the bridge's first connection.
+    pub async fn start_prepared(instance: &str, timing: TimingOverrides, prepare: impl FnOnce(&FakeCoolmaster)) -> Harness {
         let broker = FakeBroker::start().await;
         broker.cap_connections(50);
         let coolmaster = FakeCoolmaster::start().await;
+        prepare(&coolmaster);
         let topics = Topics::new(ROOT, instance).expect("the test's topics");
         let address = Address::parse(&coolmaster.address).expect("the stand-in's address");
         let running = Bridge::new(ROOT)

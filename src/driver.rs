@@ -12,6 +12,7 @@
 //! - a failure is classified as [`protocol`] says; I/O, a closed connection and EOF before the
 //!   prompt are the link's ([`LinkError`]).
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use mqtt_bridge_kit::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::protocol;
 
@@ -81,11 +82,31 @@ pub struct Coolmaster {
     /// Why the link was dropped between operations, for the next one to say.
     dropped: Option<String>,
     report: Option<Reporter>,
+    /// The units whose listing line cannot be used now, as last said.
+    passed_over: BTreeSet<String>,
 }
 
 impl Coolmaster {
     pub fn new(address: Address) -> Coolmaster {
-        Coolmaster { address, link: None, dropped: None, report: None }
+        Coolmaster { address, link: None, dropped: None, report: None, passed_over: BTreeSet::new() }
+    }
+
+    /// Say which units a listing passed over: an INFO when a unit's line first cannot be used,
+    /// DEBUG while it stays so, an INFO when it can be used again — never a line per poll (every
+    /// 4 s) for as long as a unit is listed garbled.
+    fn note(&mut self, listing: &protocol::Listing) {
+        for bad in &listing.bad {
+            if self.passed_over.insert(bad.unit.clone()) {
+                info!(unit = %bad.unit, line = %bad.line, error = %bad.why, "A unit's ls2 line cannot be used; the unit is passed over");
+            } else {
+                debug!(unit = %bad.unit, line = %bad.line, error = %bad.why, "A unit's ls2 line still cannot be used");
+            }
+        }
+        for state in &listing.states {
+            if self.passed_over.remove(&state.target) {
+                info!(unit = %state.target, "A unit's ls2 line can be used again");
+            }
+        }
     }
 
     /// A command and its reply (bounded by the runtime's deadline on the operation): the reply's
@@ -193,7 +214,8 @@ impl DeviceDriver for Coolmaster {
         self.dropped = None;
     }
 
-    /// `ls2`: every unit (`Scope::All`, and `Scope::Any`), or one.
+    /// `ls2`: every unit (`Scope::All`, and `Scope::Any`), or one. A line that cannot be used costs
+    /// only its own unit; a listing with no usable line is `Unusable`.
     async fn read_state(&mut self, scope: Scope) -> Result<Vec<TargetState>, OpError> {
         let unit = match &scope {
             Scope::Target(unit) => Some(unit.as_str()),
@@ -201,7 +223,9 @@ impl DeviceDriver for Coolmaster {
         };
         let command = protocol::list(unit)?;
         let body = self.exchange(&command).await?;
-        protocol::parse_listing(&body)
+        let listing = protocol::parse_listing(&body);
+        self.note(&listing);
+        listing.into_states()
     }
 
     /// A command per property, in the CoolMaster's order ([`protocol::plan`]). A property that
