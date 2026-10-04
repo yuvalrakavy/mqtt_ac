@@ -1,40 +1,33 @@
 [package]
 name = "mqtt_ac"
-version = "0.2.1"
+version = "2.0.0"
 edition = "2021"
+description = "The CoolMaster bridge: the Bridge Kit grammar, on the Bridge Runtime (mqtt-bridge-kit)"
+license = "MIT"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# v2 serves the new Store only. The old home system keeps v1: branch `v1`, tag `v0.2.1`.
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mqtt_ac"
+path = "src/main.rs"
 
 [dependencies]
-thiserror = "2.0.12"
-error-stack = "0.6.0" 
-tokio = { version="1.47.1", features = ["full", "tracing"]}
-tokio-util = "0.7.16"
-tokio-stream = "0.1.17"
-async-channel = "2.5.0"
-serde_json = "1.0.142"
-serde = { version = "1.0.219", features = ["derive"] }
-rumqttc = { version = "0.25.1", default-features = false }
-rustop = "1.1.4"
-tracing = { version = "0.1.41"  }
-log = "0.4.27"
-tracing-init = { git="http://github.com/yuvalrakavy/tracing-init.git", features = ["otel"] }
-built = "0.8.0"
-
-[build-dependencies]
-built = { version= "0.8.0", features = ["chrono"] }
+# TODO: pin to the tracing-init git rev once R1 merges
+mqtt-bridge-kit = { path = "/Users/yuval/Documents/Projects/tracing-init-br/mqtt-bridge-kit" }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+tracing = "0.1"
 
 [dev-dependencies]
-# The fleet's test tools, from the same repository as tracing-init (one revision for all three).
-wait-lint = { git="http://github.com/yuvalrakavy/tracing-init.git" }
-mqtt-test-broker = { git="http://github.com/yuvalrakavy/tracing-init.git" }
-# The tests' log capture (src/test_support.rs): the version tracing-init builds on.
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
-# Its callsite-interest rebuild (`rebuild_interest_cache`), which `tracing` does not re-export.
-tracing-core = "0.1"
-
-# The otel feature was added at git rev 69ff434 (version 0.2.0).
-# Run `cargo update -p tracing-init` after first clone to refresh the lock file.
+# The fleet's test tools, from the same repository as the runtime (one revision for all).
+# TODO: pin to the tracing-init git rev once R1 merges
+mqtt-test-broker = { path = "/Users/yuval/Documents/Projects/tracing-init-br/mqtt-test-broker" }
+# TODO: pin to the tracing-init git rev once R1 merges
+wait-lint = { path = "/Users/yuval/Documents/Projects/tracing-init-br/wait-lint" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 
 # to run with logging use
 #  RUST_LOG=trace,rumqttc=off mqtt_ac ...

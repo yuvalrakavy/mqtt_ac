@@ -1,0 +1,3 @@
+# Written wide, like the Bridge Runtime it is built on (tracing-init mqtt-bridge-kit).
+max_width = 140
+use_small_heuristics = "Max"

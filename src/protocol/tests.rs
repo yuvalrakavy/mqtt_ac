@@ -1,0 +1,166 @@
+use serde_json::json;
+
+use super::*;
+
+fn map(value: Value) -> PropertyMap {
+    match value {
+        Value::Object(map) => map,
+        other => panic!("not an object: {other}"),
+    }
+}
+
+fn commands(unit: &str, values: Value) -> Vec<Result<String, OpError>> {
+    plan(unit, &map(values)).expect("a unit address").into_iter().map(|step| step.command).collect()
+}
+
+fn ok(lines: &[&str]) -> Vec<Result<String, OpError>> {
+    lines.iter().map(|line| Ok((*line).to_owned())).collect()
+}
+
+/// A reply's status decides it: `OK` (and `ERROR: 0`, as v1 had it) is success, with the body;
+/// any other status is the CoolMaster refusing the command — `Rejected`, which keeps the link up.
+#[test]
+fn an_error_status_is_a_rejection_and_ok_is_success() {
+    assert_eq!(parse_reply(b"OK\r\n"), Ok(String::new()));
+    assert_eq!(parse_reply(b"ERROR: 0\r\n"), Ok(String::new()));
+    assert_eq!(parse_reply(b"L1.001 ON 22.0C 25.0C High Cool OK - 0\r\nOK\r\n"), Ok("L1.001 ON 22.0C 25.0C High Cool OK - 0".to_owned()));
+    assert_eq!(parse_reply(b"a\r\nb\r\nOK\r\n"), Ok("a\r\nb".to_owned()));
+    for refused in [&b"ERROR: 1\r\n"[..], b"ERROR: 3", b"Unknown command\r\n", b"body\r\nERROR: 2\r\n"] {
+        assert!(
+            matches!(parse_reply(refused), Err(OpError::Rejected(_))),
+            "{:?} was not a rejection: {:?}",
+            String::from_utf8_lossy(refused),
+            parse_reply(refused)
+        );
+    }
+}
+
+/// A reply that cannot be read — not text, or no status at all — is `Unusable`: reported and
+/// passed over, never a reason to reconnect.
+#[test]
+fn a_reply_that_cannot_be_read_is_unusable() {
+    for unusable in [&b"\xff\xfe\r\nOK\r\n"[..], b"", b"\r\n", b"  "] {
+        assert!(
+            matches!(parse_reply(unusable), Err(OpError::Unusable(_))),
+            "{:?} was not unusable: {:?}",
+            String::from_utf8_lossy(unusable),
+            parse_reply(unusable)
+        );
+    }
+}
+
+/// A unit's `ls2` line becomes its State document, with v1's field names and value strings.
+#[test]
+fn an_ls2_line_is_a_state_document() {
+    let state = parse_line("L4.001 OFF 19.0C 23.5C Med Heat OK   - 0").unwrap();
+    assert_eq!(state.target, "L4.001");
+    assert_eq!(
+        Value::Object(state.values),
+        json!({
+            "unit": "L4.001", "power": false, "target_temperature": 19.0, "temperature": 23.5,
+            "fan_speed": "Medium", "operation_mode": "Heat", "failure_code": null,
+            "filter_change": false, "demand": false
+        })
+    );
+    let state = parse_line("L7.400 ON 77F 72.5F VLow Fan 12 # 1").unwrap();
+    assert_eq!(state.values["target_temperature"], json!(25.0));
+    assert_eq!(state.values["temperature"], json!(22.5));
+    assert_eq!(state.values["fan_speed"], json!("VLow"));
+    assert_eq!(state.values["failure_code"], json!(12));
+    assert_eq!(state.values["filter_change"], json!(true));
+    assert_eq!(state.values["demand"], json!(true));
+    for (word, value) in [("Low", "Low"), ("High", "High"), ("Top", "Top"), ("Auto", "Auto")] {
+        let state = parse_line(&format!("L1.001 ON 22C 22C {word} Auto OK - 0")).unwrap();
+        assert_eq!(state.values["fan_speed"], json!(value));
+    }
+    for mode in ["Cool", "Heat", "Dry", "Fan", "Auto"] {
+        let state = parse_line(&format!("L1.001 ON 22C 22C Low {mode} OK - 0")).unwrap();
+        assert_eq!(state.values["operation_mode"], json!(mode));
+    }
+}
+
+/// A line that does not parse says why, and never panics — a multibyte temperature included
+/// (v1's re-review C5: a byte slice inside `°` ended the worker).
+#[test]
+fn a_line_that_does_not_parse_says_why() {
+    for bad in [
+        "",
+        "L1.001 ON 22.0C 25.0C High Cool OK -",
+        "L1.001 ON 22.0C 25.0C High Cool OK - 0 extra",
+        "L1.001 MAYBE 22.0C 25.0C High Cool OK - 0",
+        "L1.001 ON 25° 23.0C High Cool OK - 0",
+        "L1.001 ON 22.0K 25.0C High Cool OK - 0",
+        "L1.001 ON NaNC 25.0C High Cool OK - 0",
+        "L1.001 ON infC 25.0C High Cool OK - 0",
+        "L1.001 ON 22.0C 25.0C Turbo Cool OK - 0",
+        "L1.001 ON 22.0C 25.0C High Freeze OK - 0",
+        "L1.001 ON 22.0C 25.0C High Cool A3 - 0",
+        "L1.001 ON 22.0C 25.0C High Cool OK x 0",
+        "L1.001 ON 22.0C 25.0C High Cool OK - 2",
+        "L1/001 ON 22.0C 25.0C High Cool OK - 0",
+    ] {
+        let parsed = std::panic::catch_unwind(|| parse_line(bad));
+        assert!(matches!(parsed, Ok(Err(_))), "`{bad}` was not refused: {parsed:?}");
+    }
+}
+
+/// The commands, formatted as v1 sent them.
+#[test]
+fn each_property_is_its_command() {
+    assert_eq!(commands("L7.400", json!({"power": true})), ok(&["on L7.400"]));
+    assert_eq!(commands("L7.400", json!({"power": false})), ok(&["off L7.400"]));
+    for (mode, word) in [("Cool", "cool"), ("Heat", "heat"), ("Dry", "dry"), ("Fan", "fan"), ("Auto", "auto")] {
+        assert_eq!(commands("L7.400", json!({"operation_mode": mode})), ok(&[&format!("{word} L7.400")]));
+    }
+    for (speed, letter) in [("VLow", "v"), ("Low", "l"), ("Medium", "m"), ("High", "h"), ("Top", "t"), ("Auto", "a")] {
+        assert_eq!(commands("L7.400", json!({"fan_speed": speed})), ok(&[&format!("fspeed L7.400 {letter}")]));
+    }
+    assert_eq!(commands("L7.400", json!({"target_temperature": 22})), ok(&["temp L7.400 22"]));
+    assert_eq!(commands("L7.400", json!({"target_temperature": 22.0})), ok(&["temp L7.400 22"]));
+    assert_eq!(commands("L7.400", json!({"target_temperature": 21.5})), ok(&["temp L7.400 21.5"]));
+    assert_eq!(list(None), Ok("ls2".to_owned()));
+    assert_eq!(list(Some("L1.001")), Ok("ls2 L1.001".to_owned()));
+    assert_eq!(reset_filter("L1.001"), Ok("filt L1.001".to_owned()));
+}
+
+/// An `apply`'s commands go in the order the CoolMaster needs: power on first; the mode before the
+/// setpoint and the fan speed; power off last.
+#[test]
+fn an_apply_goes_power_on_first_then_mode_setpoint_fan_and_power_off_last() {
+    let all = |power: bool| json!({"fan_speed": "Low", "target_temperature": 24, "power": power, "operation_mode": "Heat"});
+    assert_eq!(commands("L1.001", all(true)), ok(&["on L1.001", "heat L1.001", "temp L1.001 24", "fspeed L1.001 l"]));
+    assert_eq!(commands("L1.001", all(false)), ok(&["heat L1.001", "temp L1.001 24", "fspeed L1.001 l", "off L1.001"]));
+    assert_eq!(commands("L1.001", json!({"fan_speed": "Top", "operation_mode": "Cool"})), ok(&["cool L1.001", "fspeed L1.001 t"]));
+}
+
+/// A value outside its property's vocabulary is `Rejected`, a property no request can set is
+/// `Unsupported` — each in its own step, so the rest of the request still applies.
+#[test]
+fn a_value_outside_its_vocabulary_is_rejected_and_an_unknown_property_unsupported() {
+    let steps = plan("L1.001", &map(json!({"power": false, "fan_speed": "Turbo", "swing": true, "target_temperature": "22"}))).unwrap();
+    let by_property = |p: &str| steps.iter().find(|s| s.property == p).map(|s| s.command.clone()).unwrap();
+    assert!(matches!(by_property("fan_speed"), Err(OpError::Rejected(_))), "{steps:?}");
+    assert!(matches!(by_property("target_temperature"), Err(OpError::Rejected(_))), "{steps:?}");
+    assert!(matches!(by_property("swing"), Err(OpError::Unsupported(_))), "{steps:?}");
+    assert_eq!(by_property("power"), Ok("off L1.001".to_owned()));
+    assert_eq!(steps.last().map(|s| s.property.as_str()), Some("power"), "power off is not last: {steps:?}");
+    for bad in [json!({"power": "true"}), json!({"power": 1}), json!({"operation_mode": "cool"}), json!({"fan_speed": "Med"})] {
+        let steps = plan("L1.001", &map(bad.clone())).unwrap();
+        assert!(matches!(steps[0].command, Err(OpError::Rejected(_))), "{bad} was not rejected: {steps:?}");
+    }
+}
+
+/// A target that is not a unit address is refused before anything is sent: one with a space or a
+/// `\r` would end the command early and start another on the CoolMaster, and an empty one would
+/// make `filt` reset every unit's filter.
+#[test]
+fn a_target_that_is_not_a_unit_address_is_rejected() {
+    for bad in ["", "L1.001 L1.002", "L1.001\roff L1.002", "L1.001\n", "L1;001", "*"] {
+        assert!(matches!(plan(bad, &map(json!({"power": true}))), Err(OpError::Rejected(_))), "{bad:?} was planned");
+        assert!(matches!(reset_filter(bad), Err(OpError::Rejected(_))), "{bad:?} was reset");
+        assert!(matches!(list(Some(bad)), Err(OpError::Rejected(_))), "{bad:?} was listed");
+    }
+    for good in ["L7.400", "L1.001", "100", "M1-2_3"] {
+        assert!(valid_unit(good), "{good}");
+    }
+}
