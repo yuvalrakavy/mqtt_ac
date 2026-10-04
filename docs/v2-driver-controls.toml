@@ -113,15 +113,28 @@ guard       = "apply_order_power_off_last"
 [[control]]
 name        = "a_refusal_ends_the_apply"
 file        = "src/driver.rs"
-anchor      = '''                Err(e) => failed.push((step.property, e)),'''
+anchor      = '''                Err(e) => failed.push(failure(step.property, e)),'''
 replacement = '''                Err(e) => {
-                    failed.push((step.property, e));
+                    failed.push(failure(step.property, e));
                     break;
                 }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_rejected_value_is_an_error_and_the_rest_still_applies", "--exact"]
 expect_text = '''turning the unit off was lost to the refused setpoint'''
 guard       = "apply_passes_over_a_failed_property"
+
+# A write with one refused property reported as failed whole (a plain `Rejected`, as before
+# `OpError::Partial`): the power-off the CoolMaster took is reported failed too, and the Store
+# abandons it.
+[[control]]
+name        = "a_partial_apply_fails_the_whole_write"
+file        = "src/driver.rs"
+anchor      = '''        Err(OpError::Partial(failed))'''
+replacement = '''        Err(OpError::Rejected(failed[0].error.clone()))'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_rejected_value_is_an_error_and_the_rest_still_applies", "--exact"]
+expect_text = '''the power-off, which the CoolMaster took, was reported failed'''
+guard       = "apply_outcome_per_property"
 
 # --- The unit address, the read-back, the registry ---
 

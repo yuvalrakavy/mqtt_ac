@@ -92,7 +92,9 @@ Every `Error` carries a `reason`:
 | `malformed` | a payload or topic the bridge cannot read |
 
 A property that fails on its own is passed over and the rest of the request still sent: a refused
-setpoint does not cost a power-off. One `ls2` line that cannot be read costs only its own unit.
+setpoint does not cost a power-off. Each property is a CoolMaster command of its own, confirmed or
+refused alone, with nothing rolled back — so the `Error` names only the failed property, and the
+rest are confirmed through `State`. One `ls2` line that cannot be read costs only its own unit.
 
 ## Running it
 

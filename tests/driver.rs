@@ -80,9 +80,10 @@ async fn reset_filter_resets_the_units_filter() {
 }
 
 /// A value the CoolMaster refuses (a setpoint its unit cannot take) is an `Error` naming the unit
-/// and the property, `"reason": "rejected"`; the rest of the request is still sent — turning the
-/// unit off is not lost to the refused setpoint — and the link stays up. A value outside its
-/// property's vocabulary is refused the same way, without being sent.
+/// and that property only, `"reason": "rejected"`: the rest of the request is still sent, and
+/// stands as applied — turning the unit off is not lost to the refused setpoint, and is confirmed
+/// through `State`, never reported failed (`OpError::Partial`). The link stays up. A value outside
+/// its property's vocabulary is refused the same way, without being sent.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejected_value_is_an_error_and_the_rest_still_applies() {
     let h = Harness::start("rejected").await;
@@ -96,9 +97,11 @@ async fn a_rejected_value_is_an_error_and_the_rest_still_applies() {
     );
     let error = &h.errors_for("L1.002", "target_temperature")[0];
     assert_eq!(error["reason"], "rejected", "{error}");
-    assert!(
-        error["error"].as_str().is_some_and(|e| e.contains("ERROR: 4")),
-        "the Error does not say what the CoolMaster answered: {error}"
+    // The write's Errors go out together: by now one for the power-off would have too.
+    assert!(h.errors_for("L1.002", "power").is_empty(), "the power-off, which the CoolMaster took, was reported failed: {:?}", h.errors());
+    assert_eq!(
+        error["error"], "the CoolMaster answered `ERROR: 4`",
+        "the Error does not say, alone, what the CoolMaster answered the setpoint: {error}"
     );
     assert!(
         h.eventually(BOUND, |h| h.state("L1.002").is_some_and(|s| s["power"] == false)).await,

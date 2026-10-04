@@ -17,8 +17,8 @@ use std::fmt;
 use std::time::Duration;
 
 use mqtt_bridge_kit::{
-    CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, Feedback, LinkContext, LinkError, OpError, PropertyMap, Reporter,
-    Scope, TargetState, Timing, Value, Writes,
+    CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkContext, LinkError, OpError,
+    PropertyFailure, PropertyMap, Reporter, Scope, TargetState, Timing, Value, Writes,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -198,28 +198,29 @@ fn lost(e: std::io::Error) -> OpError {
     OpError::Link(LinkError::from(e))
 }
 
-/// An error's own message, without its class.
-fn message(e: &OpError) -> String {
-    match e {
-        OpError::Rejected(m) | OpError::Unusable(m) | OpError::Unsupported(m) => m.clone(),
-        OpError::Link(e) => e.reason().to_owned(),
-        partial @ OpError::Partial(_) => partial.to_string(),
-    }
+/// One property's failure in an `apply`, with its own class and message.
+fn failure(property: String, e: OpError) -> PropertyFailure {
+    let (class, error) = match e {
+        OpError::Rejected(m) => (FailureClass::Rejected, m),
+        OpError::Unusable(m) => (FailureClass::Unusable, m),
+        OpError::Unsupported(m) => (FailureClass::Unsupported, m),
+        // Neither comes from one property's command: a lost link ends the apply first, and only an
+        // apply's outcome is partial.
+        other @ (OpError::Link(_) | OpError::Partial(_)) => (FailureClass::Rejected, other.to_string()),
+    };
+    PropertyFailure { property, class, error }
 }
 
-/// An `apply`'s outcome: `Ok`, or the first failure's class, naming every property that failed.
-/// (The runtime reports an `apply`'s failure on `Error` for each of its properties.)
-fn outcome(failed: Vec<(String, OpError)>) -> Result<(), OpError> {
-    let Some((_, first)) = failed.first() else {
-        return Ok(());
-    };
-    let text = failed.iter().map(|(property, e)| format!("{property}: {}", message(e))).collect::<Vec<_>>().join("; ");
-    Err(match first {
-        OpError::Rejected(_) | OpError::Partial(_) => OpError::Rejected(text),
-        OpError::Unusable(_) => OpError::Unusable(text),
-        OpError::Unsupported(_) => OpError::Unsupported(text),
-        OpError::Link(e) => OpError::Link(e.clone()),
-    })
+/// An `apply`'s outcome: `Ok`, or the properties that failed on their own, each with its class
+/// (`OpError::Partial`) — every other property of the write stands as applied, and the CoolMaster
+/// has it: each property is a command of its own, confirmed or refused alone, with nothing rolled
+/// back. The Store hears an `Error` for the failed ones only.
+fn outcome(failed: Vec<PropertyFailure>) -> Result<(), OpError> {
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(OpError::Partial(failed))
+    }
 }
 
 impl DeviceDriver for Coolmaster {
@@ -276,8 +277,9 @@ impl DeviceDriver for Coolmaster {
     /// A command per property, in the CoolMaster's order ([`protocol::plan`]). A property that
     /// fails on its own — refused by the CoolMaster, answered with something unusable, or not one
     /// a request can set — is passed over and the rest still sent (turning a unit off is not lost
-    /// to a refused setpoint); a lost link ends it at once, and the runtime holds the request for
-    /// the next connection. Then the unit is read back.
+    /// to a refused setpoint); the outcome names only the failed ones (`OpError::Partial`). A lost
+    /// link ends it at once, and the runtime holds the request for the next connection. Then the
+    /// unit is read back. A target that is not a unit address fails the whole write (`Rejected`).
     async fn apply(&mut self, target: &str, values: &PropertyMap) -> Result<(), OpError> {
         let mut failed = Vec::new();
         let mut sent = false;
@@ -292,7 +294,7 @@ impl DeviceDriver for Coolmaster {
             match done {
                 Ok(()) => {}
                 Err(OpError::Link(e)) => return Err(OpError::Link(e)),
-                Err(e) => failed.push((step.property, e)),
+                Err(e) => failed.push(failure(step.property, e)),
             }
         }
         if sent {
@@ -353,19 +355,24 @@ mod tests {
         }
     }
 
-    /// An `apply` that partly failed names every property that failed, in the class of the first.
+    /// An `apply` that partly failed is `Partial`, naming each failed property with its own class
+    /// and message; one that did not fail is `Ok`.
     #[test]
-    fn an_apply_that_partly_failed_names_each_property() {
+    fn an_apply_that_partly_failed_names_each_property_with_its_class() {
         assert_eq!(outcome(Vec::new()), Ok(()));
         let failed = vec![
-            ("target_temperature".to_owned(), OpError::Rejected("the CoolMaster answered `ERROR: 1`".into())),
-            ("swing".to_owned(), OpError::Unsupported("`swing` is not a property a request can set".into())),
+            failure("target_temperature".to_owned(), OpError::Rejected("the CoolMaster answered `ERROR: 1`".into())),
+            failure("fan_speed".to_owned(), OpError::Unusable("the CoolMaster's reply is not text".into())),
+            failure("swing".to_owned(), OpError::Unsupported("`swing` is not a property a request can set".into())),
         ];
+        let failure = |property: &str, class, error: &str| PropertyFailure { property: property.into(), class, error: error.into() };
         assert_eq!(
             outcome(failed),
-            Err(OpError::Rejected(
-                "target_temperature: the CoolMaster answered `ERROR: 1`; swing: `swing` is not a property a request can set".into()
-            ))
+            Err(OpError::Partial(vec![
+                failure("target_temperature", FailureClass::Rejected, "the CoolMaster answered `ERROR: 1`"),
+                failure("fan_speed", FailureClass::Unusable, "the CoolMaster's reply is not text"),
+                failure("swing", FailureClass::Unsupported, "`swing` is not a property a request can set"),
+            ]))
         );
     }
 }
