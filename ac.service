@@ -28,12 +28,14 @@
 #
 
 [Unit]
-Description=MQTT_AC
+Description=MQTT_AC v2 (the CoolMaster bridge on the Bridge Runtime)
 After=systemd-networkd-wait-online.service
 Wants=systemd-networkd-wait-online.service
 
 [Service]
-ExecStart=/home/pi/mqtt_ac "TLV" control-tlv 10.0.10.105
+# v2 serves the new Store: --broker is the new Store's broker, not the old system's (v1, branch
+# `v1`, talks to that one). The topics' root is Aircondition unless --root says otherwise.
+ExecStart=/home/pi/mqtt_ac --instance "TLV" --broker control-tlv --coolmaster 10.0.10.105
 WorkingDirectory=/home/pi
 StandardOutput=file:/home/pi/logs/ac.log
 StandardError=file:/home/pi/logs/ac_error.log
