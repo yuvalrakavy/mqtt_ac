@@ -49,10 +49,13 @@ shutdown, the exit status), and logging. This crate keeps only the CoolMaster:
 - `src/driver.rs` — the `DeviceDriver`: `info()` (acknowledged writes, observed feedback,
   `ResetFilter` momentary, v1's timing: connect 10 s, operation 10 s, retry 5 s, WARN at 30 s,
   poll 4 s); one TCP connection, one exchange at a time (command + `\r`, reply up to the `>`
-  prompt); `apply` passes over a property that fails on its own and sends the rest, a lost link
-  ends it; each command is read back (`ls2 <unit>`) so State follows at once.
-- `src/main.rs` — the runtime's command line plus `--coolmaster` (a driver option), and the usage
-  error for it.
+  prompt); `apply` passes over a property that fails on its own and sends the rest, returning
+  `OpError::Partial` naming only the failed ones (each property is its own CoolMaster command,
+  confirmed or refused alone, nothing rolled back), and a lost link ends it; each command is read
+  back (`ls2 <unit>`) so State follows at once; a unit a full listing no longer names has its
+  retained State retracted (`Reporter::remove`).
+- `src/main.rs` — the runtime's command line plus `--coolmaster` (a driver option, made required
+  with `Bridge::require`; an address it cannot use is `Bridge::usage_error`, said by `usage_exit`).
 
 The runtime calls the driver one operation at a time, each under its deadline (an overrun is a lost
 link), so the driver has no timeouts of its own.
@@ -62,10 +65,9 @@ a unit address are `Rejected`; a reply that is not text or has no status, and a 
 usable line, are `Unusable`; an unknown property or command is `Unsupported`; I/O, a closed
 connection and EOF before the prompt are `Link`.
 
-**The runtime's API is changing** after its review (the lead, 2026-10-04): `execute` will take
-`Option<&str>` (the driver's `command` already does), `Reporter::remove` will retract a unit that
-disappears from the listing (`TODO(remove)` in `read_state`), and `DriverInfo` gains fields
-(`info()` ends with `..DriverInfo::default()`).
+Built against the runtime after its R1 gate (tracing-init `feat/bridge-runtime` 67afa2d):
+`execute` takes `Option<&str>` (`ResetFilter` with none is Rejected), `DriverInfo` is built with
+`..DriverInfo::default()` (`restore` stays false), and `Bridge::run` installs the panic hook.
 
 ## Tests
 
@@ -74,7 +76,8 @@ disappears from the listing (`TODO(remove)` in `read_state`), and `DriverInfo` g
   keep their state, answer rules, a down mode, and a **connection cap** of 50 — keep it: an uncapped
   stand-in once let a reconnect loop exhaust the Mac's ephemeral ports).
 - `tests/driver.rs` — what the driver adds: Desired to commands (order, read-back), ResetFilter,
-  rejected and unusable replies, a lost link and a closed connection, a bad `ls2` line.
+  a partly rejected write (Error for the refused property only), unusable replies, a lost link and
+  a closed connection, a bad `ls2` line, a unit in failure, a unit leaving the listing.
 - `tests/process.rs` — the binary: SIGTERM, and `--coolmaster` usage errors.
 - **Never** the live broker (`localhost:1883` on the Mac is the house), the LAN, or a real
   CoolMaster. Several agents share this Mac: run timing-sensitive tests alone before concluding.
@@ -92,13 +95,11 @@ device outage episodes (`connection_lost`, `external_failure`, `external_recover
 `command_rejected` (WARN: the CoolMaster refused a command — fix the unit id or the value),
 `validation_rejected`, `worker_died`, `shutdown_timeout`, and the rest of its own. The driver adds
 only an INFO when a unit's `ls2` line first cannot be used (DEBUG while it stays so, INFO when it is
-usable again) and an INFO when a unit leaves the listing. The log file is `logs/mqtt_ac.*` (the
+usable again) and an INFO when a unit leaves the listing (its State retracted). The log file is `logs/mqtt_ac.*` (the
 runtime's file prefix is the application name); `logging.toml` adds GELF and OpenTelemetry.
 
 ## Not done (deliberately, for later)
 
-- **A unit that leaves the listing keeps its retained State** until the runtime's
-  `Reporter::remove` lands (`TODO(remove)`).
 - **`temp` sends the Store's number as is.** A CoolMaster set to °F would read a °C setpoint as °F
   (v1 the same); `ls2`'s °F readings are converted to °C.
 

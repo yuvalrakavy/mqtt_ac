@@ -102,23 +102,29 @@ async fn usage(args: &[&str]) -> std::process::Output {
     tokio::time::timeout(BOUND, output).await.expect("the bridge did not exit on a usage error").expect("run the bridge")
 }
 
-/// `--coolmaster` is required, and must be an address: otherwise a usage error on stderr — the
-/// command line's own output, before anything has started — and status 2, as the runtime's own
-/// options say theirs. `--help` lists it.
+/// `--coolmaster` is required (`Bridge::require`), and must be an address (`Bridge::usage_error`):
+/// otherwise a usage error on stderr — `mqtt_ac: <problem>`, then the usage text, the command
+/// line's own output before anything has started — and status 2, as the runtime's own options say
+/// theirs; a problem of the runtime's own options comes first. `--help` lists the option.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_missing_or_bad_coolmaster_address_is_a_usage_error() {
     for (args, says) in [
-        (&["--instance", "i", "--broker", "127.0.0.1:9"][..], "`--coolmaster` is required"),
-        (&["--instance", "i", "--broker", "127.0.0.1:9", "--coolmaster", "host:port"][..], "is not a port"),
-        (&["--broker", "127.0.0.1:9", "--coolmaster", "127.0.0.1"][..], "`--instance` is required"),
+        (&["--instance", "i", "--broker", "127.0.0.1:9"][..], "mqtt_ac: `--coolmaster` is required"),
+        (&["--instance", "i", "--broker", "127.0.0.1:9", "--coolmaster", "host:port"][..], "mqtt_ac: `host:port`: `port` is not a port"),
+        (&["--broker", "127.0.0.1:9", "--coolmaster", "host:port"][..], "mqtt_ac: `--instance` is required"),
     ] {
         let output = usage(args).await;
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
-        assert!(stderr.contains(says) && stderr.contains("--coolmaster"), "{args:?}: {stderr}");
+        assert!(stderr.starts_with(says), "{args:?} did not say `{says}` first: {stderr}");
+        assert!(stderr.contains("Usage: mqtt_ac") && stderr.contains("--coolmaster <value>"), "{args:?}: no usage text: {stderr}");
+        assert!(output.stdout.is_empty(), "{args:?}: a usage error wrote to stdout");
     }
     let help = usage(&["--help"]).await;
     assert_eq!(help.status.code(), Some(0));
     let text = String::from_utf8_lossy(&help.stdout);
-    assert!(text.contains("--coolmaster") && text.contains("--root") && text.contains("Aircondition"), "{text}");
+    assert!(
+        text.contains("--coolmaster <value>") && text.contains("the CoolMaster, host[:port]") && text.contains("Aircondition"),
+        "{text}"
+    );
 }

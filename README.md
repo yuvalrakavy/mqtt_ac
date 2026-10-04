@@ -63,6 +63,9 @@ v1's field names and value strings, so the Store's driver maps them as it did:
 | `filter_change` | `true` when the filter wants changing |
 | `demand` | `true` / `false` |
 
+A unit the CoolMaster no longer lists has its `State` retracted (an empty retained payload); listed
+again, it is published again.
+
 ### What a request can set (`Desired`)
 
 `power` (`true`/`false`), `operation_mode`, `fan_speed` and `target_temperature` (a number), with the
@@ -107,7 +110,8 @@ mqtt_ac --instance <controller> --broker <host[:port]> --coolmaster <host[:port]
 - `--coolmaster` — the CoolMaster (port 10102 by default).
 - `--root` — the topics' root (default `Aircondition`).
 - The runtime's timing options: `--connect-timeout` (10 s), `--operation-timeout` (10 s), `--retry`
-  (5 s), `--outage-warn` (30 s), `--poll` (4 s, or `off`), and the MQTT side's `--mqtt-*`.
+  (5 s), `--outage-warn` (30 s), `--poll` (4 s, or `off`), `--device-stable`, and the MQTT side's
+  `--mqtt-*`. (`--restore` is for one-way devices; the CoolMaster is read back, and leaves it off.)
   `--log-config <path>` names tracing-init's `logging.toml` (otherwise it is found upward from the
   working directory). `--help` lists them all.
 
