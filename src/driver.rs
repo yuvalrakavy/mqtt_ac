@@ -203,6 +203,7 @@ fn message(e: &OpError) -> String {
     match e {
         OpError::Rejected(m) | OpError::Unusable(m) | OpError::Unsupported(m) => m.clone(),
         OpError::Link(e) => e.reason().to_owned(),
+        partial @ OpError::Partial(_) => partial.to_string(),
     }
 }
 
@@ -214,7 +215,7 @@ fn outcome(failed: Vec<(String, OpError)>) -> Result<(), OpError> {
     };
     let text = failed.iter().map(|(property, e)| format!("{property}: {}", message(e))).collect::<Vec<_>>().join("; ");
     Err(match first {
-        OpError::Rejected(_) => OpError::Rejected(text),
+        OpError::Rejected(_) | OpError::Partial(_) => OpError::Rejected(text),
         OpError::Unusable(_) => OpError::Unusable(text),
         OpError::Unsupported(_) => OpError::Unsupported(text),
         OpError::Link(e) => OpError::Link(e.clone()),
@@ -301,9 +302,8 @@ impl DeviceDriver for Coolmaster {
     }
 
     /// `ResetFilter` (`filt <unit>`), then the unit read back.
-    async fn execute(&mut self, target: &str, call: &CommandCall) -> Result<Option<Value>, OpError> {
-        // The runtime passes "" for a command with no target (its `Option<&str>` is coming).
-        self.command(Some(target).filter(|t| !t.is_empty()), call).await
+    async fn execute(&mut self, target: Option<&str>, call: &CommandCall) -> Result<Option<Value>, OpError> {
+        self.command(target, call).await
     }
 
     /// The CoolMaster needs no setup per unit; a `Config`'s `feedback` is the runtime's.
