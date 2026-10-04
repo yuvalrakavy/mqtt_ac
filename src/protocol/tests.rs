@@ -150,9 +150,21 @@ fn each_property_is_its_command() {
 #[test]
 fn an_apply_goes_power_on_first_then_mode_setpoint_fan_and_power_off_last() {
     let all = |power: bool| json!({"fan_speed": "Low", "target_temperature": 24, "power": power, "operation_mode": "Heat"});
-    assert_eq!(commands("L1.001", all(true)), ok(&["on L1.001", "heat L1.001", "temp L1.001 24", "fspeed L1.001 l"]));
-    assert_eq!(commands("L1.001", all(false)), ok(&["heat L1.001", "temp L1.001 24", "fspeed L1.001 l", "off L1.001"]));
-    assert_eq!(commands("L1.001", json!({"fan_speed": "Top", "operation_mode": "Cool"})), ok(&["cool L1.001", "fspeed L1.001 t"]));
+    assert_eq!(
+        commands("L1.001", all(true)),
+        ok(&["on L1.001", "heat L1.001", "temp L1.001 24", "fspeed L1.001 l"]),
+        "turning a unit on does not go power first, then mode, setpoint, fan"
+    );
+    assert_eq!(
+        commands("L1.001", all(false)),
+        ok(&["heat L1.001", "temp L1.001 24", "fspeed L1.001 l", "off L1.001"]),
+        "turning a unit off does not go mode, setpoint, fan, then power last"
+    );
+    assert_eq!(
+        commands("L1.001", json!({"fan_speed": "Top", "operation_mode": "Cool"})),
+        ok(&["cool L1.001", "fspeed L1.001 t"]),
+        "the mode does not go before the fan speed"
+    );
 }
 
 /// A value outside its property's vocabulary is `Rejected`, a property no request can set is

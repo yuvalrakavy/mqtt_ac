@@ -1,0 +1,143 @@
+# Negative controls for mqtt_ac v2's driver: each row undoes one of the driver's guards and names
+# the test that must fail, by its failure text. Run from Store with
+#     python3 scripts/negative-control.py --root ../Home/mqtt_ac-v2 ../Home/mqtt_ac-v2/docs/v2-driver-controls.toml
+# (`--row NAME` for one). Every row must come back RED.
+#
+# The runtime's own guards (the pump, the mailbox, outages, the conflict rule, the process) are its
+# controls': tracing-init `docs/controls/2026-10-04-bridge-runtime-controls.toml`. v1's no-hang 3b
+# controls went with the code they guarded (on branch `v1`).
+#
+# Failing first, beyond these rows: `one_bad_ls2_line_does_not_fail_the_listing` against 7c03022,
+# where the listing still parsed as v1's did — "L1.001's State was never published beside a bad
+# line for L1.002: None", about 100 polls in 20 s; the row `one_bad_line_fails_the_listing` undoes
+# that fix.
+
+# --- The classification (Bridge Runtime spec §4.3) ---
+
+# An error status taken for success: the CoolMaster's refusal never reaches the Store.
+[[control]]
+name        = "an_error_status_is_success"
+file        = "src/protocol.rs"
+anchor      = '''        status => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),'''
+replacement = '''        _status => Ok(body.to_owned()),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_rejected_value_is_an_error_and_the_rest_still_applies", "--exact"]
+expect_text = '''the refused setpoint got no Error'''
+guard       = "error_status_is_rejected"
+
+# A reply that is not text taken for a lost link: the request is held and applied again on the
+# next connection instead of reported — the no-hang 3b hot loop, now paced, but still a reconnect
+# per unusable reply.
+[[control]]
+name        = "an_unreadable_reply_is_a_lost_link"
+file        = "src/protocol.rs"
+anchor      = '''        return Err(OpError::Unusable("the CoolMaster's reply is not text".into()));'''
+replacement = '''        return Err(OpError::Link(mqtt_bridge_kit::LinkError::new("the CoolMaster's reply is not text")));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "an_unusable_reply_is_passed_over_on_the_same_connection", "--exact"]
+expect_text = '''the unusable reply got no Error'''
+guard       = "unreadable_reply_is_unusable"
+
+# A connection that closed instead of answering taken for an unusable answer: the request is
+# reported and dropped, and the dead link is never reconnected.
+[[control]]
+name        = "a_closed_connection_is_an_unusable_reply"
+file        = "src/driver.rs"
+anchor      = '''            return Err(OpError::Link(LinkError::new("the CoolMaster closed the connection")));'''
+replacement = '''            return Err(OpError::Unusable("the CoolMaster closed the connection".into()));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_connection_closed_mid_command_is_a_lost_link_and_the_request_is_applied_on_reconnect", "--exact"]
+expect_text = '''the request was not applied after the reconnect'''
+guard       = "closed_connection_is_the_link"
+
+# --- The ls2 listing, a line at a time ---
+
+# One bad line fails the whole listing, as v1's did.
+[[control]]
+name        = "one_bad_line_fails_the_listing"
+file        = "src/protocol.rs"
+anchor      = '''                listing.bad.push(BadLine { unit, line: line.to_owned(), why });'''
+replacement = '''                listing.bad.push(BadLine { unit, line: line.to_owned(), why });
+                listing.states.clear();
+                return listing;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "one_bad_ls2_line_does_not_fail_the_listing", "--exact"]
+expect_text = '''was never published beside a bad line'''
+guard       = "ls2_per_line_tolerance"
+
+# --- The apply order ---
+
+# Power on sent last, after the settings a unit that is off may not take.
+[[control]]
+name        = "power_on_goes_last"
+file        = "src/protocol.rs"
+anchor      = '''        POWER => 0,'''
+replacement = '''        POWER => 6,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_target_level_desired_becomes_coolmaster_commands_in_order_and_state_follows", "--exact"]
+expect_text = '''the request did not reach the CoolMaster once, in its order'''
+guard       = "apply_order_power_on_first"
+
+# Power off sent first, before the settings.
+[[control]]
+name        = "power_off_goes_first"
+file        = "src/protocol.rs"
+anchor      = '''        POWER if values.get(POWER) == Some(&Value::Bool(false)) => 5,'''
+replacement = '''        POWER if values.get(POWER) == Some(&Value::Bool(false)) => 0,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::an_apply_goes_power_on_first_then_mode_setpoint_fan_and_power_off_last", "--exact"]
+expect_text = '''turning a unit off does not go mode, setpoint, fan, then power last'''
+guard       = "apply_order_power_off_last"
+
+# A property that fails on its own ends the apply: a refused setpoint costs the power-off sent
+# after it.
+[[control]]
+name        = "a_refusal_ends_the_apply"
+file        = "src/driver.rs"
+anchor      = '''                Err(e) => failed.push((step.property, e)),'''
+replacement = '''                Err(e) => {
+                    failed.push((step.property, e));
+                    break;
+                }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_rejected_value_is_an_error_and_the_rest_still_applies", "--exact"]
+expect_text = '''turning the unit off was lost to the refused setpoint'''
+guard       = "apply_passes_over_a_failed_property"
+
+# --- The unit address, the read-back, the registry ---
+
+# Any target taken for a unit address: a space or a `\r` starts a second command on the
+# CoolMaster, and an empty one makes `filt` reset every unit.
+[[control]]
+name        = "any_target_is_a_unit_address"
+file        = "src/protocol.rs"
+anchor      = '''    !unit.is_empty() && unit.len() <= 32 && unit.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))'''
+replacement = '''    let _ = unit;
+    true'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::a_target_that_is_not_a_unit_address_is_rejected", "--exact"]
+expect_text = '''was planned'''
+guard       = "unit_address_guard"
+
+# No read-back after a command: with polling off, the unit's State never follows.
+[[control]]
+name        = "no_read_back_after_a_command"
+file        = "src/driver.rs"
+anchor      = '''            self.read_back(target).await;'''
+replacement = '''            let _ = target;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_property_write_becomes_its_command", "--exact"]
+expect_text = '''the unit's State did not follow'''
+guard       = "read_back_after_a_command"
+
+# A wait with no tag: the registry test is wired to the driver's source.
+[[control]]
+name        = "a_wait_loses_its_tag"
+file        = "src/driver.rs"
+anchor      = '''        // WAIT: coolmaster-io
+        link.read_until(b'>', &mut reply).await.map_err(lost)?;'''
+replacement = '''        link.read_until(b'>', &mut reply).await.map_err(lost)?;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "wait_registry"]
+expect_text = '''is an untagged wait'''
+guard       = "registry_wired"

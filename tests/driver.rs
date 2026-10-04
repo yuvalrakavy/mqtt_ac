@@ -179,6 +179,28 @@ async fn a_request_held_through_a_lost_link_is_applied_on_recovery() {
     assert!(h.stop().await);
 }
 
+/// A CoolMaster that closes the connection instead of answering a command has lost the link —
+/// not given an unusable answer: the request is held, and applied on the next connection, with
+/// no `Error`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_closed_mid_command_is_a_lost_link_and_the_request_is_applied_on_reconnect() {
+    let h = Harness::start("closed").await;
+    assert!(h.connected().await);
+    h.coolmaster.answer_once("on", Answer::Close);
+    assert!(h.desire("L1.001", "power", json!(true), REQUEST));
+    assert!(
+        h.eventually(BOUND, |h| h.state("L1.001").is_some_and(|s| s["power"] == true)).await,
+        "the request was not applied after the reconnect: {:?}; the commands: {:?}; the errors: {:?}",
+        h.state("L1.001"),
+        h.coolmaster.commands(),
+        h.errors()
+    );
+    assert_eq!(h.coolmaster.served(), 2, "the closed connection was not reconnected once");
+    assert_eq!(h.coolmaster.commands().iter().filter(|c| *c == "on L1.001").count(), 2);
+    assert!(h.errors().is_empty(), "a lost link was reported as the request's failure: {:?}", h.errors());
+    assert!(h.stop().await);
+}
+
 /// One `ls2` line the bridge cannot use — a unit the CoolMaster lists garbled — is passed over: the
 /// other units' `State` is published from the first listing on, and a poll still carries their
 /// changes. v1 failed the whole listing on one bad line, so no unit's `State` changed at all. The
