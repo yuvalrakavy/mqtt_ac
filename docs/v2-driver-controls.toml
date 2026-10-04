@@ -12,7 +12,11 @@
 # Failing first, beyond these rows: `one_bad_ls2_line_does_not_fail_the_listing` against 7c03022,
 # where the listing still parsed as v1's did — "L1.001's State was never published beside a bad
 # line for L1.002: None", about 100 polls in 20 s; the row `one_bad_line_fails_the_listing` undoes
-# that fix.
+# that fix. And `a_unit_in_failure_keeps_its_state_current` with
+# `protocol::tests::a_failure_code_is_the_controllers_text` against b8b2402, where a failure code
+# was a number only — "a unit in failure with an alphanumeric code was not published: … \"failure_code\":
+# Null …" and "a unit in failure with code `A3` was not read as that code: Err(\"failure code `A3`\")";
+# the row `a_failure_code_is_a_number_only` undoes that fix.
 
 # --- The classification (Bridge Runtime spec §4.3) ---
 
@@ -66,6 +70,18 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "one_bad_ls2_line_does_not_fail_the_listing", "--exact"]
 expect_text = '''was never published beside a bad line'''
 guard       = "ls2_per_line_tolerance"
+
+# A failure code read as a number only, as v1's was: an alphanumeric code (`U4`) makes the line
+# unusable, and the unit's State freezes while it is in failure.
+[[control]]
+name        = "a_failure_code_is_a_number_only"
+file        = "src/protocol.rs"
+anchor      = '''        code => Value::from(code),'''
+replacement = '''        code => Value::from(code.parse::<u16>().map_err(|_| format!("failure code `{code}`"))?),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_in_failure_keeps_its_state_current", "--exact"]
+expect_text = '''a unit in failure with an alphanumeric code was not published'''
+guard       = "failure_code_as_printed"
 
 # --- The apply order ---
 

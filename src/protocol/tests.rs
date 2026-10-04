@@ -66,7 +66,7 @@ fn an_ls2_line_is_a_state_document() {
     assert_eq!(state.values["target_temperature"], json!(25.0));
     assert_eq!(state.values["temperature"], json!(22.5));
     assert_eq!(state.values["fan_speed"], json!("VLow"));
-    assert_eq!(state.values["failure_code"], json!(12));
+    assert_eq!(state.values["failure_code"], json!("12"));
     assert_eq!(state.values["filter_change"], json!(true));
     assert_eq!(state.values["demand"], json!(true));
     for (word, value) in [("Low", "Low"), ("High", "High"), ("Top", "Top"), ("Auto", "Auto")] {
@@ -77,6 +77,23 @@ fn an_ls2_line_is_a_state_document() {
         let state = parse_line(&format!("L1.001 ON 22C 22C Low {mode} OK - 0")).unwrap();
         assert_eq!(state.values["operation_mode"], json!(mode));
     }
+}
+
+/// A unit in failure keeps its State: the failure code is the CoolMaster's own text — vendor codes
+/// are often alphanumeric (`A3`, `U4`) — and `null` for `OK`. As a number only (v1), an
+/// alphanumeric code made the whole line unusable, and the unit's State froze for as long as it
+/// was in failure, just when it mattered.
+#[test]
+fn a_failure_code_is_the_controllers_text() {
+    for code in ["A3", "U4", "E-01", "12", "6602"] {
+        let line = format!("L1.001 ON 22.0C 25.0C High Cool {code} - 0");
+        let parsed = parse_line(&line);
+        assert!(
+            parsed.as_ref().is_ok_and(|s| s.values["failure_code"] == json!(code)),
+            "a unit in failure with code `{code}` was not read as that code: {parsed:?}"
+        );
+    }
+    assert_eq!(parse_line("L1.001 ON 22.0C 25.0C High Cool OK - 0").unwrap().values["failure_code"], Value::Null);
 }
 
 /// A line that does not parse says why, and never panics — a multibyte temperature included
@@ -94,7 +111,6 @@ fn a_line_that_does_not_parse_says_why() {
         "L1.001 ON infC 25.0C High Cool OK - 0",
         "L1.001 ON 22.0C 25.0C Turbo Cool OK - 0",
         "L1.001 ON 22.0C 25.0C High Freeze OK - 0",
-        "L1.001 ON 22.0C 25.0C High Cool A3 - 0",
         "L1.001 ON 22.0C 25.0C High Cool OK x 0",
         "L1.001 ON 22.0C 25.0C High Cool OK - 2",
         "L1/001 ON 22.0C 25.0C High Cool OK - 0",

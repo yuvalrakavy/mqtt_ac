@@ -7,7 +7,7 @@
 //!   any other status is the CoolMaster refusing the command.
 //! - **`ls2`** lists every unit (`ls2`) or one (`ls2 <unit>`), a line each:
 //!   `L1.001 ON 22.0C 25.0C High Cool OK - 0` — the unit, its power, the setpoint, the room
-//!   temperature, the fan speed, the mode, the failure code (`OK` or a number), the filter flag
+//!   temperature, the fan speed, the mode, the failure code (`OK`, or the code: `A3`, `12`), the filter flag
 //!   (`-`, or `#` when the filter wants changing) and demand (`0` or `1`).
 //! - **The commands:** `on`/`off <unit>`, `cool`/`heat`/`dry`/`fan`/`auto <unit>`,
 //!   `temp <unit> <t>`, `fspeed <unit> v|l|m|h|t|a`, `filt <unit>`.
@@ -22,8 +22,9 @@
 //! **The State document** keeps v1's field names and value strings, so the Store's driver maps
 //! them as it did: `unit`, `power`, `target_temperature` and `temperature` (°C), `fan_speed`
 //! (`VLow` `Low` `Medium` `High` `Top` `Auto`), `operation_mode` (`Cool` `Heat` `Dry` `Fan`
-//! `Auto`), `failure_code` (a number, or `null`), `filter_change` and `demand`. The four a request
-//! may set are `power`, `operation_mode`, `fan_speed` and `target_temperature`.
+//! `Auto`), `failure_code` (the code as the CoolMaster prints it, a string — `"A3"`, `"12"` — or
+//! `null` for `OK`), `filter_change` and `demand`. The four a request may set are `power`,
+//! `operation_mode`, `fan_speed` and `target_temperature`.
 
 use mqtt_bridge_kit::{OpError, PropertyMap, TargetState, Value};
 
@@ -120,9 +121,11 @@ pub fn parse_line(line: &str) -> Result<TargetState, String> {
     let room = temperature(room)?;
     let fan = FAN_SPEEDS.iter().find(|(_, word, _)| *word == fan).map(|(value, _, _)| *value).ok_or(format!("fan speed `{fan}`"))?;
     let mode = MODES.iter().find(|(value, _)| *value == mode).map(|(value, _)| *value).ok_or(format!("mode `{mode}`"))?;
+    // The code exactly as the CoolMaster prints it: vendor codes are often alphanumeric (`A3`,
+    // `U4`), and a unit in failure must never freeze its State (v1 took numbers only).
     let failure = match failure {
         "OK" => Value::Null,
-        code => Value::from(code.parse::<u16>().map_err(|_| format!("failure code `{code}`"))?),
+        code => Value::from(code),
     };
     let filter = match filter {
         "-" => false,

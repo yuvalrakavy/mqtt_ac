@@ -227,3 +227,32 @@ async fn one_bad_ls2_line_does_not_fail_the_listing() {
     assert_eq!(h.coolmaster.served(), 1, "a bad line was taken for a lost link: the bridge reconnected");
     assert!(h.stop().await);
 }
+
+/// A unit that goes into failure keeps its `State` current: its `failure_code` is the
+/// CoolMaster's own code (`"U4"`), and a change at the unit meanwhile still shows. A code read as a
+/// number only (v1) made the line unusable, and the unit's State froze while it was in failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unit_in_failure_keeps_its_state_current() {
+    let h = Harness::start_with("failure", quick(Some(Duration::from_millis(200)))).await;
+    assert!(h.connected().await);
+    assert!(h.state("L1.001").unwrap()["failure_code"].is_null());
+    h.coolmaster.change("L1.001", |unit| unit.failure = Some("U4"));
+    assert!(
+        h.eventually(BOUND, |h| h.state("L1.001").is_some_and(|s| s["failure_code"] == "U4")).await,
+        "a unit in failure with an alphanumeric code was not published: {:?}",
+        h.state("L1.001")
+    );
+    h.coolmaster.change("L1.001", |unit| unit.room = 27.5);
+    assert!(
+        h.eventually(BOUND, |h| h.state("L1.001").is_some_and(|s| s["temperature"] == 27.5 && s["failure_code"] == "U4")).await,
+        "the State of a unit in failure froze: {:?}",
+        h.state("L1.001")
+    );
+    h.coolmaster.change("L1.001", |unit| unit.failure = None);
+    assert!(
+        h.eventually(BOUND, |h| h.state("L1.001").is_some_and(|s| s["failure_code"].is_null())).await,
+        "the failure did not clear: {:?}",
+        h.state("L1.001")
+    );
+    assert!(h.stop().await);
+}

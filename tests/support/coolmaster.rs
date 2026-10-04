@@ -35,7 +35,8 @@ pub struct Unit {
     pub fan: &'static str,
     /// `Cool`, `Heat`, `Dry`, `Fan` or `Auto`.
     pub mode: &'static str,
-    pub failure: Option<u16>,
+    /// The failure code as the CoolMaster prints it (`A3`, `12`); `None` lists `OK`.
+    pub failure: Option<&'static str>,
     pub filter: bool,
     pub demand: bool,
 }
@@ -49,7 +50,7 @@ impl Unit {
             self.room,
             self.fan,
             self.mode,
-            self.failure.map_or("OK".to_owned(), |code| code.to_string()),
+            self.failure.unwrap_or("OK"),
             if self.filter { "#" } else { "-" },
             if self.demand { "1" } else { "0" },
         )

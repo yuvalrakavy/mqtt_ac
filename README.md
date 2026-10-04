@@ -59,7 +59,7 @@ v1's field names and value strings, so the Store's driver maps them as it did:
 | `target_temperature`, `temperature` | numbers, °C (a CoolMaster reporting °F is converted) |
 | `fan_speed` | `VLow` `Low` `Medium` `High` `Top` `Auto` |
 | `operation_mode` | `Cool` `Heat` `Dry` `Fan` `Auto` |
-| `failure_code` | `null`, or the controller's code as a number |
+| `failure_code` | `null` when the unit is `OK`; otherwise the code exactly as the CoolMaster prints it, a string (`"A3"`, `"U4"`, `"12"`) |
 | `filter_change` | `true` when the filter wants changing |
 | `demand` | `true` / `false` |
 
@@ -136,5 +136,6 @@ covered by its conformance suite; these cover the driver. Negative controls:
 | `Error/{ctrl}` retained, a bare string | not retained, `{error, reason, target, property?, command?}` |
 | a request while the CoolMaster is down: held only while the bridge runs | held to its expiry, also across a bridge restart (retained `Desired`), with the outage conflict rule |
 | one bad `ls2` line failed the whole listing | it costs only its own unit |
+| `failure_code` a number: an alphanumeric code (`A3`) made the line unusable | a string, exactly as the CoolMaster prints it, or `null` |
 | `Version/{ctrl}` `mqtt_ac: 0.2.1 (built at …)` | `Version/{ctrl}` `mqtt_ac 2.0.0`, retained |
 | its own pump, mailbox, reports and process code | the Bridge Runtime; what remains is the CoolMaster protocol as a `DeviceDriver` |

@@ -101,5 +101,7 @@ runtime's file prefix is the application name); `logging.toml` adds GELF and Ope
   `Reporter::remove` lands (`TODO(remove)`).
 - **`temp` sends the Store's number as is.** A CoolMaster set to °F would read a °C setpoint as °F
   (v1 the same); `ls2`'s °F readings are converted to °C.
-- **`failure_code` is a number or null**, as v1 had it: an alphanumeric code (`A3`, `U4`) makes the
-  unit's line unusable, so that unit's State stops updating while it is in failure.
+
+`failure_code` is a string (the code as the CoolMaster prints it: `"A3"`, `"12"`) or null for
+`OK`. v1 took numbers only, so an alphanumeric code froze a unit's State while it was in failure;
+never narrow it back.
