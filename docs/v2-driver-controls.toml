@@ -7,7 +7,8 @@
 # controls': tracing-init `docs/controls/2026-10-04-bridge-runtime-controls.toml`. v1's no-hang 3b
 # controls went with the code they guarded (on branch `v1`).
 #
-# Run on 2026-10-04, at b2697d6: all 10 RED on the first run (2 min 14 s).
+# Run on 2026-10-04, at b2697d6: all 10 RED on the first run (2 min 14 s). Again at 875dc37, with
+# `a_failure_code_is_a_number_only` added: all 11 RED (2 min 36 s).
 #
 # Failing first, beyond these rows: `one_bad_ls2_line_does_not_fail_the_listing` against 7c03022,
 # where the listing still parsed as v1's did — "L1.001's State was never published beside a bad
