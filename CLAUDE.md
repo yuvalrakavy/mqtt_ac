@@ -69,7 +69,7 @@ that is not text or is empty, and a listing with no usable line, are `Unusable`;
 `Unsupported`; I/O, a closed connection, EOF before the prompt and a prompt or reply past
 `MAX_REPLY` (64 KiB) are `Link`.
 
-Built against the runtime after its R1 re-gate (tracing-init `feat/bridge-runtime` 0617008):
+Built against the runtime after its R1 re-gates (tracing-init `feat/bridge-runtime` 3128c96):
 `execute` takes `Option<&str>` (`ResetFilter` with none is Rejected), `DriverInfo` is built with
 `..DriverInfo::default()` (`restore` stays false), and `Bridge::run` installs the panic hook.
 
@@ -85,7 +85,8 @@ Built against the runtime after its R1 re-gate (tracing-init `feat/bridge-runtim
   a bad `ls2` line, a unit in failure, a unit leaving the listing (and a garbled address, an empty
   or unusable listing retracting nothing), the read-back stalled or dead, a °F unit, and the
   Store's own request shape.
-- `tests/process.rs` — the binary: SIGTERM, and `--coolmaster` usage errors.
+- `tests/process.rs` — the binary: SIGTERM, `--coolmaster` usage errors, and `main` handing the
+  driver `--operation-timeout` (a stalled read-back with a 1 s bound stays within it).
 - **Never** the live broker (`localhost:1883` on the Mac is the house), the LAN, or a real
   CoolMaster. Several agents share this Mac: run timing-sensitive tests alone before concluding.
 - Negative controls: `docs/v2-driver-controls.toml`, run from Store with
@@ -110,6 +111,9 @@ runtime's file prefix is the application name); `logging.toml` adds GELF and Ope
 - **A unit unbound while the bridge was stopped keeps its retained State**: the first listing has
   nothing to compare with. Retracting it needs the runtime to hand drivers the targets it read back
   at start-up (a runtime follow-up).
+- **A garble that still reads as an address** (`L7.4O1` for `L7.401`) cannot be told from a real
+  unit (re-gate R2, accepted): listed twice in a row in place of the real one, it is published as a
+  unit and the real one retracted, until the garble ends.
 
 **Temperatures:** State is in °C. A unit the CoolMaster lists in °F is converted, and a setpoint
 (asked in °C, 0–50) is sent to it in °F (`Scale`, from its last usable line). For a unit whose

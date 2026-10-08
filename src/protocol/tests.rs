@@ -178,6 +178,8 @@ fn a_setpoint_is_rounded_to_the_coolmasters_step_and_kept_in_range() {
         (json!(22.04), "22.0"),
         (json!(22.06), "22.1"),
         (json!(0), "0.0"),
+        // A negative zero (serde_json keeps its sign) is zero, never `-0.0`.
+        (json!(-0.0), "0.0"),
         (json!(50), "50.0"),
     ] {
         assert_eq!(

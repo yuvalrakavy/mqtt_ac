@@ -123,12 +123,23 @@ guard       = "apply_order_power_off_last"
 [[control]]
 name        = "a_setpoint_is_sent_raw"
 file        = "src/protocol.rs"
-anchor      = '''    format!("{:.1}", (t * 10.0).round() / 10.0)'''
+anchor      = '''    format!("{:.1}", (t * 10.0).round() / 10.0 + 0.0)'''
 replacement = '''    format!("{t}")'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::a_setpoint_is_rounded_to_the_coolmasters_step_and_kept_in_range", "--exact"]
 expect_text = '''was not sent as'''
 guard       = "setpoint_step"
+
+# A negative zero kept: `temp L1.001 -0.0`.
+[[control]]
+name        = "a_negative_zero_is_kept"
+file        = "src/protocol.rs"
+anchor      = '''    format!("{:.1}", (t * 10.0).round() / 10.0 + 0.0)'''
+replacement = '''    format!("{:.1}", (t * 10.0).round() / 10.0)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::a_setpoint_is_rounded_to_the_coolmasters_step_and_kept_in_range", "--exact"]
+expect_text = '''the setpoint -0.0 was not sent as 0.0'''
+guard       = "setpoint_no_negative_zero"
 
 # Any finite setpoint taken: 1e300 °C goes to the CoolMaster.
 [[control]]
@@ -263,6 +274,33 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_stalled_read_back_leaves_a_confirmed_command_confirmed", "--exact"]
 expect_text = '''a confirmed command was reported failed'''
 guard       = "read_back_bound"
+
+# The read-back's margin gone: its bound runs to the operation's deadline (a millisecond past it,
+# so the race is decided), and the runtime's deadline cuts the confirmed command into `link_lost`.
+[[control]]
+name        = "the_read_back_has_no_margin"
+file        = "src/driver.rs"
+anchor      = '''        let budget = self.operation_bound.saturating_sub(started.elapsed()).saturating_sub(self.operation_bound / 5);'''
+replacement = '''        let budget = self.operation_bound.saturating_sub(started.elapsed()) + Duration::from_millis(1);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_stalled_read_back_leaves_a_confirmed_command_confirmed", "--exact"]
+expect_text = '''a confirmed command was reported failed'''
+guard       = "read_back_margin"
+
+# `main` not handing the driver the command line's `--operation-timeout`: the driver keeps to its
+# default 10 s, and with a 1 s bound a stalled read-back outruns the operation.
+[[control]]
+name        = "main_drops_the_operation_bound"
+file        = "src/main.rs"
+anchor      = '''        Some(Ok(address)) => bridge.run(Coolmaster::new(address).operation_bound(operation)),'''
+replacement = '''        Some(Ok(address)) => {
+            let _ = operation;
+            bridge.run(Coolmaster::new(address))
+        }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "process", "--", "the_binary_keeps_a_read_back_within_its_operation_timeout", "--exact"]
+expect_text = '''a confirmed command was reported failed'''
+guard       = "main_operation_bound"
 
 # A read-back that finds the link dead keeps it to itself: with polling off, the bridge stays
 # "connected" on a dead socket.

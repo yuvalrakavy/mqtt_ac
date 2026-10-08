@@ -68,7 +68,12 @@ v1's field names and value strings, so the Store's driver maps them as it did:
 | `demand` | `true` / `false` |
 
 A unit the CoolMaster no longer lists has its `State` retracted (an empty retained payload); listed
-again, it is published again.
+again, it is published again. Only once two usable full listings in a row have omitted it (8 s at
+the default poll; with `--poll off`, two connects or refreshes). An empty listing, one with no
+readable line, or one with a garbled unit address never retracts anything. A unit removed while
+the bridge was stopped is **not** retracted: the bridge's first listing has nothing to compare
+with, so its old State stays at the broker. A garble that still reads as an address (`L7.4O1` for
+`L7.401`) cannot be told from a real unit.
 
 ### What a request can set (`Desired`)
 

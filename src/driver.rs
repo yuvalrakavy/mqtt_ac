@@ -109,7 +109,9 @@ struct Known {
 }
 
 /// Usable full listings in a row that must omit a unit before it is taken for gone: one listing
-/// can be cut short or come mid-scan; two in a row (8 s at the default poll) say it left.
+/// can be cut short or come mid-scan; two in a row (8 s at the default poll) say it left. With
+/// polling off (`--poll off`), full listings come only at a connect or a `refresh`, so it is two of
+/// those.
 pub const GONE_AFTER: u32 = 2;
 
 /// The most a prompt or a reply may be, in bytes, before its `>`: far past any CoolMaster's (a

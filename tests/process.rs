@@ -97,6 +97,62 @@ async fn sigterm_stops_the_bridge_cleanly() {
     assert!(broker.events().iter().any(|e| matches!(e, BrokerEvent::Disconnected)), "the bridge did not DISCONNECT");
 }
 
+/// The binary hands the driver the operation bound its command line set (`--operation-timeout`),
+/// so a read-back keeps within it: with a 1 s bound and the read-back after a confirmed
+/// `ResetFilter` stalled, the command stays confirmed (the stalled link is dropped and reconnected)
+/// — never `link_lost` because the driver kept to its default 10 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_binary_keeps_a_read_back_within_its_operation_timeout() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let coolmaster = FakeCoolmaster::start().await;
+    coolmaster.cap_connections(20);
+    coolmaster.answer_once("ls2 L1.002", Answer::Gated);
+    let dir = workdir("operation_timeout");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_mqtt_ac"))
+        .args(["--instance", INSTANCE, "--broker", &broker.address(), "--coolmaster", &coolmaster.address, "--root", PROC_ROOT])
+        .args(["--operation-timeout", "1s", "--poll", "off", "--retry", "300ms"])
+        .arg("--log-config")
+        .arg(dir.join("logging.toml"))
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the bridge");
+    let state = format!("{PROC_ROOT}/State/{INSTANCE}/L1.002");
+    let errors = format!("{PROC_ROOT}/Error/{INSTANCE}");
+    assert!(broker.wait_until(BOUND, |b| !b.received_on(&state).is_empty()).await, "the bridge never published its units");
+    let command = format!("{PROC_ROOT}/Command/{INSTANCE}");
+    let payload = serde_json::json!({"target": "L1.002", "command": "ResetFilter"}).to_string();
+    assert!(broker.send_with(&command, payload, &SendOptions::default().expiry(30)));
+    let reconnected = broker_wait(&coolmaster, |c| c.served() == 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let errors = broker.received_on(&errors);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    assert!(reconnected, "the stalled read-back's link was not dropped and reconnected");
+    assert!(
+        errors.is_empty(),
+        "a confirmed command was reported failed (the read-back outran the operation bound): {:?}",
+        errors.iter().map(|r| String::from_utf8_lossy(&r.payload).into_owned()).collect::<Vec<_>>()
+    );
+    assert!(!coolmaster.unit("L1.002").unwrap().filter);
+}
+
+/// Wait until `ready` holds for the stand-in, up to `BOUND`.
+async fn broker_wait(coolmaster: &FakeCoolmaster, ready: impl Fn(&FakeCoolmaster) -> bool) -> bool {
+    let deadline = std::time::Instant::now() + BOUND;
+    while std::time::Instant::now() < deadline {
+        if ready(coolmaster) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    ready(coolmaster)
+}
+
 async fn usage(args: &[&str]) -> std::process::Output {
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_mqtt_ac")).args(args).stdin(Stdio::null()).output();
     tokio::time::timeout(BOUND, output).await.expect("the bridge did not exit on a usage error").expect("run the bridge")

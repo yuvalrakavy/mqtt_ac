@@ -292,7 +292,8 @@ fn setpoint(celsius: f64, scale: Scale) -> String {
         Scale::Celsius => celsius,
         Scale::Fahrenheit => celsius * 9.0 / 5.0 + 32.0,
     };
-    format!("{:.1}", (t * 10.0).round() / 10.0)
+    // `+ 0.0` makes a negative zero (which serde_json keeps) a zero: never `temp L1 -0.0`.
+    format!("{:.1}", (t * 10.0).round() / 10.0 + 0.0)
 }
 
 /// The commands that apply `values` to `unit`, in the order the CoolMaster needs them:
