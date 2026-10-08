@@ -112,6 +112,30 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib
 expect_text = '''turning a unit off does not go mode, setpoint, fan, then power last'''
 guard       = "apply_order_power_off_last"
 
+# --- The setpoint ---
+
+# The raw float sent, as before the review: float noise and absurd numbers go to the CoolMaster.
+[[control]]
+name        = "a_setpoint_is_sent_raw"
+file        = "src/protocol.rs"
+anchor      = '''    format!("{:.1}", (t * 10.0).round() / 10.0)'''
+replacement = '''    format!("{t}")'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::a_setpoint_is_rounded_to_the_coolmasters_step_and_kept_in_range", "--exact"]
+expect_text = '''was not sent as'''
+guard       = "setpoint_step"
+
+# Any finite setpoint taken: 1e300 °C goes to the CoolMaster.
+[[control]]
+name        = "any_setpoint_is_in_range"
+file        = "src/protocol.rs"
+anchor      = '''            Some(t) if SETPOINT_RANGE.contains(&t) =>'''
+replacement = '''            Some(t) if t.is_finite() =>'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::a_setpoint_is_rounded_to_the_coolmasters_step_and_kept_in_range", "--exact"]
+expect_text = '''was not refused'''
+guard       = "setpoint_range"
+
 # A property that fails on its own ends the apply: a refused setpoint costs the power-off sent
 # after it.
 [[control]]

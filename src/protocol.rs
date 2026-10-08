@@ -245,11 +245,20 @@ fn command(unit: &str, property: &str, value: &Value) -> Result<String, OpError>
             None => refuse("VLow, Low, Medium, High, Top or Auto"),
         },
         TARGET_TEMPERATURE => match value.as_f64() {
-            Some(t) if t.is_finite() => Ok(format!("temp {unit} {t}")),
-            _ => refuse("a number"),
+            Some(t) if SETPOINT_RANGE.contains(&t) => Ok(format!("temp {unit} {}", setpoint(t))),
+            _ => refuse("a number of °C from 0 to 50"),
         },
         other => Err(OpError::Unsupported(format!("`{other}` is not a property a request can set"))),
     }
+}
+
+/// The setpoints a request may ask, in °C; the CoolMaster refuses what its unit cannot take.
+pub const SETPOINT_RANGE: std::ops::RangeInclusive<f64> = 0.0..=50.0;
+
+/// A setpoint as the CoolMaster takes it: at its step, 0.1°, with one decimal (`21.7`) — as v1
+/// sent it, and never the noise of float arithmetic (`21.700000000000003`).
+fn setpoint(t: f64) -> String {
+    format!("{:.1}", (t * 10.0).round() / 10.0)
 }
 
 /// The commands that apply `values` to `unit`, in the order the CoolMaster needs them:

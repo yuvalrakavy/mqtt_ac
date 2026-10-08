@@ -32,7 +32,7 @@ async fn a_target_level_desired_becomes_coolmaster_commands_in_order_and_state_f
     h.settle(SETTLE).await;
     assert_eq!(
         h.coolmaster.commands_since(before),
-        ["on L1.001", "heat L1.001", "temp L1.001 24", "fspeed L1.001 l", "ls2 L1.001"],
+        ["on L1.001", "heat L1.001", "temp L1.001 24.0", "fspeed L1.001 l", "ls2 L1.001"],
         "the request did not reach the CoolMaster once, in its order, and then a read-back"
     );
     assert!(h.errors().is_empty(), "{:?}", h.errors());
@@ -89,7 +89,8 @@ async fn a_rejected_value_is_an_error_and_the_rest_still_applies() {
     let h = Harness::start("rejected").await;
     assert!(h.connected().await);
     let before = h.coolmaster.commands().len();
-    assert!(h.desire_many("L1.002", json!({"target_temperature": 99, "power": false}), REQUEST));
+    // 40 °C: in the bridge's range, past the (stand-in) unit's 10–35.
+    assert!(h.desire_many("L1.002", json!({"target_temperature": 40, "power": false}), REQUEST));
     assert!(
         h.eventually(BOUND, |h| !h.errors_for("L1.002", "target_temperature").is_empty()).await,
         "the refused setpoint got no Error: {:?}",
@@ -109,7 +110,7 @@ async fn a_rejected_value_is_an_error_and_the_rest_still_applies() {
         h.state("L1.002"),
         h.coolmaster.commands()
     );
-    assert_eq!(h.coolmaster.commands_since(before), ["temp L1.002 99", "off L1.002", "ls2 L1.002"]);
+    assert_eq!(h.coolmaster.commands_since(before), ["temp L1.002 40.0", "off L1.002", "ls2 L1.002"]);
     assert_eq!(h.coolmaster.unit("L1.002").unwrap().setpoint, 24.0);
 
     let before = h.coolmaster.commands().len();

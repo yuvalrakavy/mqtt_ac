@@ -153,12 +153,37 @@ fn each_property_is_its_command() {
     for (speed, letter) in [("VLow", "v"), ("Low", "l"), ("Medium", "m"), ("High", "h"), ("Top", "t"), ("Auto", "a")] {
         assert_eq!(commands("L7.400", json!({"fan_speed": speed})), ok(&[&format!("fspeed L7.400 {letter}")]));
     }
-    assert_eq!(commands("L7.400", json!({"target_temperature": 22})), ok(&["temp L7.400 22"]));
-    assert_eq!(commands("L7.400", json!({"target_temperature": 22.0})), ok(&["temp L7.400 22"]));
+    assert_eq!(commands("L7.400", json!({"target_temperature": 22})), ok(&["temp L7.400 22.0"]));
+    assert_eq!(commands("L7.400", json!({"target_temperature": 22.0})), ok(&["temp L7.400 22.0"]));
     assert_eq!(commands("L7.400", json!({"target_temperature": 21.5})), ok(&["temp L7.400 21.5"]));
     assert_eq!(list(None), Ok("ls2".to_owned()));
     assert_eq!(list(Some("L1.001")), Ok("ls2 L1.001".to_owned()));
     assert_eq!(reset_filter("L1.001"), Ok("filt L1.001".to_owned()));
+}
+
+/// A setpoint goes to the CoolMaster at its step, 0.1 °C, with one decimal, as v1 sent it
+/// (`21.7`): never the noise of the Store's arithmetic (`21.700000000000003`). One outside
+/// 0–50 °C, or not finite, is `Rejected` unsent.
+#[test]
+fn a_setpoint_is_rounded_to_the_coolmasters_step_and_kept_in_range() {
+    for (value, sent) in [
+        (json!(21.700000000000003), "21.7"),
+        (json!(0.1 + 0.2 + 21.4), "21.7"),
+        (json!(22.04), "22.0"),
+        (json!(22.06), "22.1"),
+        (json!(0), "0.0"),
+        (json!(50), "50.0"),
+    ] {
+        assert_eq!(
+            commands("L1.001", json!({ "target_temperature": value })),
+            ok(&[&format!("temp L1.001 {sent}")]),
+            "the setpoint {value} was not sent as {sent}"
+        );
+    }
+    for value in [json!(1e300), json!(-0.5), json!(50.1), json!(-1e300)] {
+        let sent = commands("L1.001", json!({ "target_temperature": value }));
+        assert!(matches!(sent[0], Err(OpError::Rejected(_))), "the setpoint {value} was not refused: {sent:?}");
+    }
 }
 
 /// An `apply`'s commands go in the order the CoolMaster needs: power on first; the mode before the
@@ -168,12 +193,12 @@ fn an_apply_goes_power_on_first_then_mode_setpoint_fan_and_power_off_last() {
     let all = |power: bool| json!({"fan_speed": "Low", "target_temperature": 24, "power": power, "operation_mode": "Heat"});
     assert_eq!(
         commands("L1.001", all(true)),
-        ok(&["on L1.001", "heat L1.001", "temp L1.001 24", "fspeed L1.001 l"]),
+        ok(&["on L1.001", "heat L1.001", "temp L1.001 24.0", "fspeed L1.001 l"]),
         "turning a unit on does not go power first, then mode, setpoint, fan"
     );
     assert_eq!(
         commands("L1.001", all(false)),
-        ok(&["heat L1.001", "temp L1.001 24", "fspeed L1.001 l", "off L1.001"]),
+        ok(&["heat L1.001", "temp L1.001 24.0", "fspeed L1.001 l", "off L1.001"]),
         "turning a unit off does not go mode, setpoint, fan, then power last"
     );
     assert_eq!(
