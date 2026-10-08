@@ -68,7 +68,7 @@ or not), and a listing with no usable line, are `Unusable`; an unknown property 
 `Unsupported`; I/O, a closed connection, EOF before the prompt and a prompt or reply past
 `MAX_REPLY` (64 KiB) are `Link`.
 
-Built against the runtime after its R1 gate (tracing-init `feat/bridge-runtime` 67afa2d):
+Built against the runtime after its R1 re-gate (tracing-init `feat/bridge-runtime` 0617008):
 `execute` takes `Option<&str>` (`ResetFilter` with none is Rejected), `DriverInfo` is built with
 `..DriverInfo::default()` (`restore` stays false), and `Bridge::run` installs the panic hook.
 
@@ -79,8 +79,11 @@ Built against the runtime after its R1 gate (tracing-init `feat/bridge-runtime` 
   keep their state, answer rules, a down mode, and a **connection cap** of 50 — keep it: an uncapped
   stand-in once let a reconnect loop exhaust the Mac's ephemeral ports).
 - `tests/driver.rs` — what the driver adds: Desired to commands (order, read-back), ResetFilter,
-  a partly rejected write (Error for the refused property only), unusable replies, a lost link and
-  a closed connection, a bad `ls2` line, a unit in failure, a unit leaving the listing.
+  a partly rejected write (Error for the refused property only), unusable replies, a lost link (its
+  connect attempts paced), a closed connection, a command stalled mid-exchange, an over-long reply,
+  a bad `ls2` line, a unit in failure, a unit leaving the listing (and a garbled address, an empty
+  or unusable listing retracting nothing), the read-back stalled or dead, a °F unit, and the
+  Store's own request shape.
 - `tests/process.rs` — the binary: SIGTERM, and `--coolmaster` usage errors.
 - **Never** the live broker (`localhost:1883` on the Mac is the house), the LAN, or a real
   CoolMaster. Several agents share this Mac: run timing-sensitive tests alone before concluding.
