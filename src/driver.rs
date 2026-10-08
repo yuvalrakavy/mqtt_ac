@@ -95,7 +95,7 @@ pub struct Coolmaster {
     /// The units the full listings have named, for telling one gone (see [`Coolmaster::gone`]).
     known: BTreeMap<String, Known>,
     /// Each unit's scale at the CoolMaster, from its last usable line: a setpoint for a unit in
-    /// °F goes in °F. A unit not listed yet is taken for °C.
+    /// °F goes in °F. For a unit not here, `apply` reads it first, and never guesses.
     scales: BTreeMap<String, protocol::Scale>,
 }
 
@@ -395,11 +395,28 @@ impl DeviceDriver for Coolmaster {
     /// to a refused setpoint); the outcome names only the failed ones (`OpError::Partial`). A lost
     /// link ends it at once, and the runtime holds the request for the next connection. Then the
     /// unit is read back. A target that is not a unit address fails the whole write (`Rejected`).
+    ///
+    /// A setpoint goes in the unit's own scale: for a unit whose scale is not known yet (no usable
+    /// line of it listed), the unit is read first (`ls2 <unit>`) to learn it; a read that cannot
+    /// tell refuses the setpoint ("scale unknown"), never a guess of °C.
     async fn apply(&mut self, target: &str, values: &PropertyMap) -> Result<(), OpError> {
         let started = Instant::now();
         let mut failed = Vec::new();
         let mut sent = false;
-        let scale = self.scales.get(target).copied().unwrap_or(protocol::Scale::Celsius);
+        if values.contains_key(protocol::TARGET_TEMPERATURE) && !self.scales.contains_key(target) && protocol::valid_unit(target) {
+            match self.read_state(Scope::Target(target.to_owned())).await {
+                Ok(states) => {
+                    if let Some(report) = self.report() {
+                        for state in states {
+                            report.state(&state.target, state.values, false);
+                        }
+                    }
+                }
+                Err(OpError::Link(e)) => return Err(OpError::Link(e)),
+                Err(e) => debug!(unit = target, error = %e, "A unit's scale could not be read before its setpoint"),
+            }
+        }
+        let scale = self.scales.get(target).copied();
         for step in protocol::plan_scaled(target, values, scale)? {
             let done = match step.command {
                 Ok(command) => {

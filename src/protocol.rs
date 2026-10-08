@@ -253,7 +253,7 @@ fn rank(property: &str, values: &PropertyMap) -> u8 {
 }
 
 /// The command that sets `property` of `unit` (an address already checked) to `value`.
-fn command(unit: &str, property: &str, value: &Value, scale: Scale) -> Result<String, OpError> {
+fn command(unit: &str, property: &str, value: &Value, scale: Option<Scale>) -> Result<String, OpError> {
     let refuse = |what: &str| Err(OpError::Rejected(format!("`{property}` takes {what}, not {value}")));
     match property {
         POWER => match value {
@@ -270,7 +270,11 @@ fn command(unit: &str, property: &str, value: &Value, scale: Scale) -> Result<St
             None => refuse("VLow, Low, Medium, High, Top or Auto"),
         },
         TARGET_TEMPERATURE => match value.as_f64() {
-            Some(t) if SETPOINT_RANGE.contains(&t) => Ok(format!("temp {unit} {}", setpoint(t, scale))),
+            Some(t) if SETPOINT_RANGE.contains(&t) => match scale {
+                Some(scale) => Ok(format!("temp {unit} {}", setpoint(t, scale))),
+                // °C or °F, nobody can tell: a guess of °C would read as 23 °F on a °F unit.
+                None => Err(OpError::Rejected(format!("the scale of {unit} (°C or °F) is unknown: no line of it could be read"))),
+            },
             _ => refuse("a number of °C from 0 to 50"),
         },
         other => Err(OpError::Unsupported(format!("`{other}` is not a property a request can set"))),
@@ -303,12 +307,13 @@ fn setpoint(celsius: f64, scale: Scale) -> String {
 /// vocabulary `Rejected` — each in its own step, so the rest still applies. A target that is not
 /// a unit address refuses the whole request. A unit's setpoint is sent in °C; see [`plan_scaled`].
 pub fn plan(unit: &str, values: &PropertyMap) -> Result<Vec<Step>, OpError> {
-    plan_scaled(unit, values, Scale::Celsius)
+    plan_scaled(unit, values, Some(Scale::Celsius))
 }
 
 /// [`plan`], for a unit whose temperatures are in `scale` at the CoolMaster: a setpoint, asked in
-/// °C, is sent in that scale (a unit whose scale is not known yet is taken for °C).
-pub fn plan_scaled(unit: &str, values: &PropertyMap, scale: Scale) -> Result<Vec<Step>, OpError> {
+/// °C, is sent in that scale. With the scale unknown (`None`) a setpoint is `Rejected`, never sent
+/// on a guess; the rest of the request still applies.
+pub fn plan_scaled(unit: &str, values: &PropertyMap, scale: Option<Scale>) -> Result<Vec<Step>, OpError> {
     let unit = unit_address(unit)?;
     let mut properties: Vec<&String> = values.keys().collect();
     properties.sort_by_key(|p| (rank(p, values), p.as_str()));

@@ -152,6 +152,28 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--tes
 expect_text = '''a °C setpoint was not sent to a °F unit in °F'''
 guard       = "fahrenheit_setpoint"
 
+# A unit of unknown scale taken for °C, as before the re-gate (R3): 23 °C goes to a °F unit as 23.
+[[control]]
+name        = "an_unknown_scale_is_celsius"
+file        = "src/driver.rs"
+anchor      = '''        let scale = self.scales.get(target).copied();'''
+replacement = '''        let scale = self.scales.get(target).copied().or(Some(protocol::Scale::Celsius));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_setpoint_for_a_unit_of_unknown_scale_learns_it_first_and_never_guesses", "--exact"]
+expect_text = '''a setpoint was sent to a unit of unknown scale'''
+guard       = "unknown_scale_refused"
+
+# No read to learn an unknown scale: the setpoint is refused even when the unit could tell.
+[[control]]
+name        = "an_unknown_scale_is_not_read"
+file        = "src/driver.rs"
+anchor      = '''        if values.contains_key(protocol::TARGET_TEMPERATURE) && !self.scales.contains_key(target) && protocol::valid_unit(target) {'''
+replacement = '''        if false && values.contains_key(protocol::TARGET_TEMPERATURE) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_setpoint_for_a_unit_of_unknown_scale_learns_it_first_and_never_guesses", "--exact"]
+expect_text = '''the unit was not read to learn its scale'''
+guard       = "unknown_scale_learnt"
+
 # A property that fails on its own ends the apply: a refused setpoint costs the power-off sent
 # after it.
 [[control]]

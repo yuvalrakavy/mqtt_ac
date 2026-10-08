@@ -199,12 +199,20 @@ fn a_setpoint_goes_in_the_units_own_scale() {
     let listing = parse_listing("L1.001 ON 72.0F 77.0F High Cool OK - 0\r\nL1.002 ON 22.0C 25.0C High Cool OK - 0");
     assert_eq!(listing.scales.get("L1.001"), Some(&Scale::Fahrenheit));
     assert_eq!(listing.scales.get("L1.002"), Some(&Scale::Celsius));
-    let sent =
-        |value: Value| plan_scaled("L1.001", &map(json!({ "target_temperature": value })), Scale::Fahrenheit).unwrap()[0].command.clone();
+    let sent = |value: Value| {
+        plan_scaled("L1.001", &map(json!({ "target_temperature": value })), Some(Scale::Fahrenheit)).unwrap()[0].command.clone()
+    };
     assert_eq!(sent(json!(23)), Ok("temp L1.001 73.4".to_owned()), "a °C setpoint was not sent to a °F unit in °F");
     assert_eq!(sent(json!(21.7)), Ok("temp L1.001 71.1".to_owned()));
     assert!(matches!(sent(json!(60)), Err(OpError::Rejected(_))), "a setpoint out of range in °C was sent in °F");
     assert_eq!(commands("L1.001", json!({"target_temperature": 23})), ok(&["temp L1.001 23.0"]));
+    // The scale unknown: the setpoint refused, never sent on a guess; the rest still goes.
+    let steps = plan_scaled("L1.001", &map(json!({"target_temperature": 23, "power": true})), None).unwrap();
+    assert_eq!(steps[0].command, Ok("on L1.001".to_owned()));
+    assert!(
+        matches!(&steps[1].command, Err(OpError::Rejected(e)) if e.contains("unknown")),
+        "a setpoint was planned on a guess: {steps:?}"
+    );
 }
 
 /// An `apply`'s commands go in the order the CoolMaster needs: power on first; the mode before the

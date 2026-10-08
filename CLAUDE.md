@@ -112,8 +112,10 @@ runtime's file prefix is the application name); `logging.toml` adds GELF and Ope
   at start-up (a runtime follow-up).
 
 **Temperatures:** State is in °C. A unit the CoolMaster lists in °F is converted, and a setpoint
-(asked in °C, 0–50) is sent to it in °F (`Scale`, from its last usable line); a unit not listed
-yet is taken for °C. A setpoint goes at the CoolMaster's step, 0.1°, with one decimal (`21.7`).
+(asked in °C, 0–50) is sent to it in °F (`Scale`, from its last usable line). For a unit whose
+scale is not known yet, `apply` reads it first (`ls2 <unit>`); a read that cannot tell refuses the
+setpoint (Partial, Rejected, "scale unknown") — never a guess of °C. A setpoint goes at the
+CoolMaster's step, 0.1°, with one decimal (`21.7`).
 
 `failure_code` is a string (the code as the CoolMaster prints it: `"A3"`, `"12"`) or null for
 `OK`. v1 took numbers only, so an alphanumeric code froze a unit's State while it was in failure;

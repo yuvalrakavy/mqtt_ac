@@ -519,3 +519,44 @@ async fn reset_filter_without_a_unit_is_refused_unsent() {
     assert!(h.coolmaster.commands_since(before).is_empty(), "a ResetFilter with no unit was sent: {:?}", h.coolmaster.commands());
     assert!(h.stop().await);
 }
+
+/// A unit whose scale is not known yet (no usable line of it listed): before its setpoint is
+/// sent, the unit is read to learn it. A read that cannot tell refuses the setpoint — rejected,
+/// "scale unknown", nothing sent — and never guesses °C; once its line can be read, the setpoint
+/// goes in the unit's own scale.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setpoint_for_a_unit_of_unknown_scale_learns_it_first_and_never_guesses() {
+    let h = Harness::start_prepared("unknownscale", quick(None), |coolmaster| {
+        coolmaster.change("L1.001", |unit| {
+            unit.fahrenheit = true;
+            unit.setpoint = 72.0;
+        });
+        coolmaster.set_line("L1.001", Some("L1.001 ON 72.0F ??? High Cool OK - 0"));
+    })
+    .await;
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected") && h.state("L1.002").is_some()).await);
+    let before = h.coolmaster.commands().len();
+    assert!(h.desire("L1.001", "target_temperature", json!(23), REQUEST));
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("L1.001", "target_temperature").first().is_some_and(|e| e["reason"] == "rejected")).await,
+        "a setpoint for a unit of unknown scale was not refused: {:?}; the commands: {:?}",
+        h.errors(),
+        h.coolmaster.commands()
+    );
+    let sent = h.coolmaster.commands_since(before);
+    assert!(!sent.iter().any(|c| c.starts_with("temp ")), "a setpoint was sent to a unit of unknown scale: {sent:?}");
+    assert!(sent.iter().any(|c| c == "ls2 L1.001"), "the unit was not read to learn its scale: {sent:?}");
+    let error = &h.errors_for("L1.001", "target_temperature")[0];
+    assert!(error["error"].as_str().is_some_and(|e| e.contains("scale")), "{error}");
+    h.coolmaster.set_line("L1.001", None);
+    let before = h.coolmaster.commands().len();
+    assert!(h.desire("L1.001", "target_temperature", json!(23), REQUEST));
+    assert!(
+        h.eventually(BOUND, |h| h.coolmaster.commands_since(before).iter().any(|c| c.starts_with("temp "))).await,
+        "the setpoint was not sent once the scale could be learnt: {:?}",
+        h.coolmaster.commands()
+    );
+    let temps: Vec<String> = h.coolmaster.commands_since(before).into_iter().filter(|c| c.starts_with("temp ")).collect();
+    assert_eq!(temps, ["temp L1.001 73.4"], "the learnt scale was not used");
+    assert!(h.stop().await);
+}
