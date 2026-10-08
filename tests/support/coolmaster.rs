@@ -9,10 +9,12 @@
 //! While it is down it takes each connection and closes it at once, before the prompt — a
 //! CoolMaster that cannot be reached — and the connections it held are cut.
 //!
-//! It serves at most `CONNECTION_CAP` connections (fewer with `cap_connections`) and closes the
-//! rest at once, as while down. A bridge that reconnects in a loop is then caught after a few
-//! connections: uncapped, one opened thousands a second, and their TIME_WAIT sockets used up the
-//! machine's ephemeral ports — every process's on this host, for half a minute.
+//! It accepts at most `CONNECTION_CAP` connections in all, served or closed at once (fewer with
+//! `cap_connections`), and then stops listening, so the operating system refuses the rest. A
+//! bridge that reconnects in a loop is then caught after a few connections: uncapped, one opened
+//! thousands a second, and their TIME_WAIT sockets used up the machine's ephemeral ports — every
+//! process's on this host, for half a minute. `accepted` counts every attempt, for a test to bound
+//! the reconnects of an outage.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -124,7 +126,10 @@ struct Shared {
     /// with a count answers that many commands, and is then gone.
     answers: Mutex<Vec<Rule>>,
     gate: tokio::sync::Semaphore,
+    /// Connections served: taken while up, under the cap.
     served: AtomicUsize,
+    /// Every connection accepted, served or closed at once.
+    accepted: AtomicUsize,
     cap: AtomicUsize,
     commands: Mutex<Vec<String>>,
     connections: Mutex<Vec<JoinHandle<()>>>,
@@ -155,6 +160,7 @@ impl FakeCoolmaster {
             answers: Mutex::new(Vec::new()),
             gate: tokio::sync::Semaphore::new(0),
             served: AtomicUsize::new(0),
+            accepted: AtomicUsize::new(0),
             cap: AtomicUsize::new(CONNECTION_CAP),
             commands: Mutex::new(Vec::new()),
             connections: Mutex::new(Vec::new()),
@@ -162,8 +168,12 @@ impl FakeCoolmaster {
         let serving = shared.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let capped = serving.served.load(Ordering::SeqCst) >= serving.cap.load(Ordering::SeqCst);
-                if capped || !serving.up.load(Ordering::SeqCst) {
+                // Every connection counts, refused or not; past the cap the listener is dropped, so
+                // the operating system refuses the rest and no accept-and-close churn goes on.
+                if serving.accepted.fetch_add(1, Ordering::SeqCst) + 1 > serving.cap.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !serving.up.load(Ordering::SeqCst) {
                     drop(stream);
                     continue;
                 }
@@ -237,14 +247,19 @@ impl FakeCoolmaster {
         self.shared.gate.add_permits(1);
     }
 
-    /// Serve at most `cap` connections in all (`CONNECTION_CAP` by default).
+    /// Accept at most `cap` connections in all (`CONNECTION_CAP` by default), then stop listening.
     pub fn cap_connections(&self, cap: usize) {
         self.shared.cap.store(cap, Ordering::SeqCst);
     }
 
-    /// How many connections it has served.
+    /// How many connections it has served (taken while up).
     pub fn served(&self) -> usize {
         self.shared.served.load(Ordering::SeqCst)
+    }
+
+    /// How many connections it has accepted, served or closed at once: every attempt.
+    pub fn accepted(&self) -> usize {
+        self.shared.accepted.load(Ordering::SeqCst)
     }
 
     fn cut(&self) {

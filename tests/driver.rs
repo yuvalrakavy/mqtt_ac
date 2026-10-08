@@ -160,6 +160,8 @@ async fn a_request_held_through_a_lost_link_is_applied_on_recovery() {
     let h = Harness::start_with("held", quick(Some(Duration::from_millis(200)))).await;
     assert!(h.connected().await);
     assert_eq!(h.state("L1.001").unwrap()["power"], false);
+    let attempts_before = h.coolmaster.accepted();
+    let outage = std::time::Instant::now();
     h.coolmaster.set_up(false);
     assert!(
         h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await,
@@ -167,9 +169,13 @@ async fn a_request_held_through_a_lost_link_is_applied_on_recovery() {
         h.statuses()
     );
     assert!(h.desire("L1.001", "power", json!(true), REQUEST));
-    h.settle(SETTLE).await;
+    h.settle(Duration::from_millis(1500)).await;
     assert!(!h.coolmaster.commands().iter().any(|c| c == "on L1.001"), "a request reached a CoolMaster that was down");
     assert!(!h.coolmaster.unit("L1.001").unwrap().power, "the unit was turned on while the CoolMaster was down");
+    // Every attempt counts, refused or not: at most one per retry interval (300 ms), plus one.
+    let attempts = h.coolmaster.accepted() - attempts_before;
+    let paced = (outage.elapsed().as_millis() / 300) as usize + 1;
+    assert!(attempts >= 2 && attempts <= paced, "{attempts} connect attempts in an outage of {:?}: not paced at 300 ms", outage.elapsed());
     h.coolmaster.set_up(true);
     assert!(
         h.eventually(BOUND, |h| h.state("L1.001").is_some_and(|s| s["power"] == true)).await,
@@ -450,5 +456,66 @@ async fn a_unit_in_fahrenheit_gets_its_setpoint_in_fahrenheit() {
         h.state("L1.001")
     );
     assert!(h.errors().is_empty(), "{:?}", h.errors());
+    assert!(h.stop().await);
+}
+
+/// The request as the Store's S1 driver sends it today: one target-level `Desired`, not retained,
+/// with no message expiry and no `conflict`, and no property copies after it. It is applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stores_own_request_shape_is_applied() {
+    let h = Harness::start("storeshape").await;
+    assert!(h.connected().await);
+    let before = h.coolmaster.commands().len();
+    let topic = h.topics.desired_target("L1.001");
+    assert!(h.broker.send_with(&topic, json!({"power": true, "operation_mode": "Heat"}).to_string(), &SendOptions::default()));
+    assert!(
+        h.eventually(BOUND, |h| h.state("L1.001").is_some_and(|s| s["power"] == true && s["operation_mode"] == "Heat")).await,
+        "the Store's request was not applied: {:?}; the errors: {:?}",
+        h.coolmaster.commands(),
+        h.errors()
+    );
+    assert_eq!(h.coolmaster.commands_since(before), ["on L1.001", "heat L1.001", "ls2 L1.001"]);
+    assert!(h.errors().is_empty(), "{:?}", h.errors());
+    assert!(h.stop().await);
+}
+
+/// A command the CoolMaster never answers (it stalls mid-exchange, `Gated`) is a lost link at the
+/// operation's deadline: the request is held and applied on the next connection, once, and no
+/// stale reply of the stalled connection is taken for a later command's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_stalled_mid_exchange_is_a_lost_link_and_applied_after_reconnect() {
+    let h = Harness::start("stalled").await;
+    assert!(h.connected().await);
+    h.coolmaster.answer_once("on", Answer::Gated);
+    assert!(h.desire("L1.001", "power", json!(true), REQUEST));
+    assert!(
+        h.eventually(BOUND, |h| h.coolmaster.served() == 2 && h.state("L1.001").is_some_and(|s| s["power"] == true)).await,
+        "the stalled request was not applied after the reconnect: served {}, {:?}",
+        h.coolmaster.served(),
+        h.coolmaster.commands()
+    );
+    h.coolmaster.open_gate();
+    h.settle(SETTLE).await;
+    assert!(h.statuses().contains(&"unreachable".to_owned()), "the stalled link was never taken for lost: {:?}", h.statuses());
+    assert!(h.errors().is_empty(), "{:?}", h.errors());
+    assert_eq!(h.status().as_deref(), Some("connected"));
+    assert!(h.stop().await);
+}
+
+/// `ResetFilter` names its unit: one with no `target` is refused (`filt` with no unit would reset
+/// every unit's filter), and nothing is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_filter_without_a_unit_is_refused_unsent() {
+    let h = Harness::start("filternone").await;
+    assert!(h.connected().await);
+    let before = h.coolmaster.commands().len();
+    assert!(h.command(json!({"command": "ResetFilter"})));
+    assert!(
+        h.eventually(BOUND, |h| h.errors().iter().any(|e| e["command"] == "ResetFilter" && e["reason"] == "rejected")).await,
+        "a ResetFilter with no unit was not refused: {:?}",
+        h.errors()
+    );
+    h.settle(SETTLE).await;
+    assert!(h.coolmaster.commands_since(before).is_empty(), "a ResetFilter with no unit was sent: {:?}", h.coolmaster.commands());
     assert!(h.stop().await);
 }

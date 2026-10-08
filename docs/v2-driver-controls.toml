@@ -190,6 +190,19 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib
 expect_text = '''was planned'''
 guard       = "unit_address_guard"
 
+# ResetFilter's own guard, apart from `plan`'s: `filt` built from any target — an empty one would
+# reset every unit's filter, a `\r` start a second command. `plan` keeps its guard, so the test
+# gets past it and fails at `reset_filter`.
+[[control]]
+name        = "reset_filter_takes_any_target"
+file        = "src/protocol.rs"
+anchor      = '''    Ok(format!("filt {}", unit_address(unit)?))'''
+replacement = '''    Ok(format!("filt {unit}"))'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::a_target_that_is_not_a_unit_address_is_rejected", "--exact"]
+expect_text = '''was reset'''
+guard       = "reset_filter_unit_guard"
+
 # No read-back after a write: with polling off, the unit's State never follows.
 [[control]]
 name        = "no_read_back_after_a_command"
