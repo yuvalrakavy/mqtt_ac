@@ -16,7 +16,8 @@
 # rows added (the retraction rules, the setpoint, °F, the read-back, the byte limit, the status,
 # the conversion, ResetFilter's guard and read-back) and four re-anchored: the first run 27 RED and
 # 1 ANCHOR-MISS (`an_error_status_is_success`, moved by the status fix, re-anchored); then that row
-# RED (see the commit).
+# RED (see the commit). Again on 2026-10-09 at bfd28b6, against tracing-init 3128c96 (round 3):
+# all 28 RED (4 min 13 s), nothing to adapt.
 #
 # Failing first, beyond these rows: `one_bad_ls2_line_does_not_fail_the_listing` against 7c03022,
 # where the listing still parsed as v1's did — "L1.001's State was never published beside a bad
