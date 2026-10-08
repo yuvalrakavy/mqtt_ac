@@ -489,13 +489,20 @@ mod tests {
         }
         // Omitted by one usable listing: not yet; by a second in a row: gone.
         assert!(driver.gone(&listing(a)).is_empty(), "one omission retracted a unit");
-        assert_eq!(driver.gone(&listing(a)), ["L7.401"]);
+        // (The unusable listing's `garbage` and `more` read as addresses, were never reported, and
+        // are forgotten here, not retracted.)
+        assert_eq!(
+            driver.gone(&listing(a)),
+            ["L7.401"],
+            "only L7.401 is gone: a unit never reported was retracted, or the gone one was not"
+        );
         assert!(driver.gone(&listing(a)).is_empty(), "a unit was retracted twice");
         // One omission, then listed again: the count starts over.
-        assert!(driver.gone(&listing(both)).is_empty());
-        assert!(driver.gone(&listing(a)).is_empty());
-        assert!(driver.gone(&listing(both)).is_empty());
-        assert!(driver.gone(&listing(a)).is_empty());
+        let started_over = "a unit listed again was retracted: its earlier omission was not forgotten";
+        assert!(driver.gone(&listing(both)).is_empty(), "{started_over}");
+        assert!(driver.gone(&listing(a)).is_empty(), "{started_over}");
+        assert!(driver.gone(&listing(both)).is_empty(), "{started_over}");
+        assert!(driver.gone(&listing(a)).is_empty(), "{started_over}");
         // Known only from a garbled line under its address, never reported: forgotten, not retracted.
         assert!(driver.gone(&listing(&format!("{both}\r\nL7.402 ON ??? garbled"))).is_empty());
         assert!(driver.gone(&listing(both)).is_empty());

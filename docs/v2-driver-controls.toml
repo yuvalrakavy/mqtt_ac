@@ -275,13 +275,14 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--tes
 expect_text = '''a confirmed command was reported failed'''
 guard       = "read_back_bound"
 
-# The read-back's margin gone: its bound runs to the operation's deadline (a millisecond past it,
-# so the race is decided), and the runtime's deadline cuts the confirmed command into `link_lost`.
+# The read-back's margin gone: its bound runs past the operation's deadline (50 ms past: at 1 ms
+# the two timers share a tick, the runtime's polls the driver's first, and the race came out
+# GREEN), and the runtime's deadline cuts the confirmed command into `link_lost`.
 [[control]]
 name        = "the_read_back_has_no_margin"
 file        = "src/driver.rs"
 anchor      = '''        let budget = self.operation_bound.saturating_sub(started.elapsed()).saturating_sub(self.operation_bound / 5);'''
-replacement = '''        let budget = self.operation_bound.saturating_sub(started.elapsed()) + Duration::from_millis(1);'''
+replacement = '''        let budget = self.operation_bound.saturating_sub(started.elapsed()) + Duration::from_millis(50);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_stalled_read_back_leaves_a_confirmed_command_confirmed", "--exact"]
 expect_text = '''a confirmed command was reported failed'''
@@ -391,7 +392,7 @@ anchor      = '''            self.known.entry((*unit).to_owned()).or_default().m
 replacement = '''            self.known.entry((*unit).to_owned()).or_default();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_gone_only_after_two_usable_listings_omit_it", "--exact"]
-expect_text = '''retracted'''
+expect_text = '''its earlier omission was not forgotten'''
 guard       = "presence_resets_omissions"
 
 # No byte limit on a reply: a CoolMaster that floods with no prompt is buffered on until the
