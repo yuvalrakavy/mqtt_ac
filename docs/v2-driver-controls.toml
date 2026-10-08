@@ -11,7 +11,8 @@
 # `a_failure_code_is_a_number_only` added: all 11 RED (2 min 36 s). Again at eb08298, against the
 # gated runtime (tracing-init 67afa2d), with `a_partial_apply_fails_the_whole_write` and
 # `a_gone_unit_keeps_its_state` added and `a_refusal_ends_the_apply` re-anchored: all 13 RED
-# (3 min 1 s).
+# (3 min 1 s). Again on 2026-10-08 at 98b6244, against tracing-init 0617008 (round 2): all 13 RED
+# (3 min 3 s), nothing to adapt.
 #
 # Failing first, beyond these rows: `one_bad_ls2_line_does_not_fail_the_listing` against 7c03022,
 # where the listing still parsed as v1's did — "L1.001's State was never published beside a bad
