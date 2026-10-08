@@ -146,26 +146,32 @@ impl Coolmaster {
     /// again), whose retained State is to be retracted. A unit is gone once [`GONE_AFTER`] usable
     /// full listings in a row omit it, and only a unit whose State was reported is retracted (one
     /// known only from a garbled line is just forgotten). A unit listed garbled under its own
-    /// address is still there. A listing that cannot say who is there changes nothing: an empty one
-    /// (a CoolMaster rebooting, or still scanning its line), one with no usable line, and one with
-    /// a line whose address itself is garbled (which unit it was, nobody can tell).
+    /// address is still there. Every unit a listing names is there, whatever else the listing
+    /// says; but a listing that cannot say who is missing counts no omission: an empty one (a
+    /// CoolMaster rebooting, or still scanning its line), one with no usable line, and one with a
+    /// line whose address itself is garbled (which unit it was, nobody can tell).
+    ///
+    /// What it cannot tell: a garble that still reads as an address (`L7.4O1` for `L7.401`) is a
+    /// unit address like any other — listed twice in a row in place of the real one, it is
+    /// published as a unit of its own and the real one is retracted, until the garble ends. With
+    /// polling off, full listings come only at a connect or a `refresh`, so "two in a row" is two
+    /// of those.
     fn gone(&mut self, listing: &protocol::Listing) -> Vec<String> {
+        let valid_bad = listing.bad.iter().filter(|b| protocol::valid_unit(&b.unit));
+        let present: BTreeSet<&str> = listing.states.iter().map(|s| s.target.as_str()).chain(valid_bad.map(|b| b.unit.as_str())).collect();
+        for state in &listing.states {
+            self.known.entry(state.target.clone()).or_default().reported = true;
+        }
+        for unit in &present {
+            self.known.entry((*unit).to_owned()).or_default().missed = 0;
+        }
         let certain = listing.bad.iter().all(|b| protocol::valid_unit(&b.unit));
         if !certain || listing.states.is_empty() {
             return Vec::new();
         }
-        let present: BTreeSet<&str> =
-            listing.states.iter().map(|s| s.target.as_str()).chain(listing.bad.iter().map(|b| b.unit.as_str())).collect();
-        for state in &listing.states {
-            self.known.entry(state.target.clone()).or_default().reported = true;
-        }
-        for bad in &listing.bad {
-            self.known.entry(bad.unit.clone()).or_default();
-        }
         let mut gone = Vec::new();
         self.known.retain(|unit, known| {
             if present.contains(unit.as_str()) {
-                known.missed = 0;
                 return true;
             }
             known.missed += 1;
@@ -475,6 +481,11 @@ mod tests {
         assert!(driver.gone(&listing(&format!("{both}\r\nL7.402 ON ??? garbled"))).is_empty());
         assert!(driver.gone(&listing(both)).is_empty());
         assert!(driver.gone(&listing(both)).is_empty(), "a unit never reported was retracted");
+        // Omitted once, then named by a listing that cannot say who is missing (a garbled address
+        // beside it): it was there, so the run of omissions starts over.
+        assert!(driver.gone(&listing(a)).is_empty());
+        assert!(driver.gone(&listing(&format!("{both}\r\nL7.4\u{1}2 OFF 22.0C 25.0C High Cool OK - 0"))).is_empty());
+        assert!(driver.gone(&listing(a)).is_empty(), "a unit named by the listing in between was retracted");
     }
 
     /// A unit address is the target as the CoolMaster lists it — `L7.400` unchanged, never a `/`,
