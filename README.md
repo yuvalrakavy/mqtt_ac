@@ -56,7 +56,7 @@ v1's field names and value strings, so the Store's driver maps them as it did:
 |---|---|
 | `unit` | the unit address (also the topic's `{unit}`) |
 | `power` | `true` / `false` |
-| `target_temperature`, `temperature` | numbers, °C (a CoolMaster reporting °F is converted) |
+| `target_temperature`, `temperature` | numbers, °C. A unit the CoolMaster lists in °F is converted to °C here, and a setpoint asked for it (in °C) is sent to it in °F; a unit not listed yet is taken for °C |
 | `fan_speed` | `VLow` `Low` `Medium` `High` `Top` `Auto` |
 | `operation_mode` | `Cool` `Heat` `Dry` `Fan` `Auto` |
 | `failure_code` | `null` when the unit is `OK`; otherwise the code exactly as the CoolMaster prints it, a string (`"A3"`, `"U4"`, `"12"`) |

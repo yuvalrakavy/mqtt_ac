@@ -100,8 +100,13 @@ runtime's file prefix is the application name); `logging.toml` adds GELF and Ope
 
 ## Not done (deliberately, for later)
 
-- **`temp` sends the Store's number as is.** A CoolMaster set to °F would read a °C setpoint as °F
-  (v1 the same); `ls2`'s °F readings are converted to °C.
+- **A unit unbound while the bridge was stopped keeps its retained State**: the first listing has
+  nothing to compare with. Retracting it needs the runtime to hand drivers the targets it read back
+  at start-up (a runtime follow-up).
+
+**Temperatures:** State is in °C. A unit the CoolMaster lists in °F is converted, and a setpoint
+(asked in °C, 0–50) is sent to it in °F (`Scale`, from its last usable line); a unit not listed
+yet is taken for °C. A setpoint goes at the CoolMaster's step, 0.1°, with one decimal (`21.7`).
 
 `failure_code` is a string (the code as the CoolMaster prints it: `"A3"`, `"12"`) or null for
 `OK`. v1 took numbers only, so an alphanumeric code froze a unit's State while it was in failure;

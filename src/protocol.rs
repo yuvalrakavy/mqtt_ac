@@ -86,8 +86,16 @@ pub fn parse_reply(reply: &[u8]) -> Result<String, OpError> {
     }
 }
 
-/// A temperature as `ls2` gives it (`22.0C`, `72F`), in °C.
-fn temperature(text: &str) -> Result<f64, String> {
+/// The scale a unit's temperatures are in at the CoolMaster: what `ls2` shows them in, and what
+/// `temp` takes. State is in °C whatever it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scale {
+    Celsius,
+    Fahrenheit,
+}
+
+/// A temperature as `ls2` gives it (`22.0C`, `72F`), in °C, and the scale it was given in.
+fn temperature(text: &str) -> Result<(f64, Scale), String> {
     // The value, and its scale: the last character, whatever its width in bytes — a byte slice
     // at `len() - 1` panics inside a multibyte one (`25°`; v1's re-review C5).
     let mut chars = text.chars();
@@ -97,14 +105,19 @@ fn temperature(text: &str) -> Result<f64, String> {
         return Err(format!("`{text}` is not a temperature"));
     }
     match scale {
-        Some('C') => Ok(value),
-        Some('F') => Ok((value - 32.0) * 5.0 / 9.0),
+        Some('C') => Ok((value, Scale::Celsius)),
+        Some('F') => Ok(((value - 32.0) * 5.0 / 9.0, Scale::Fahrenheit)),
         _ => Err(format!("`{text}` is not a temperature")),
     }
 }
 
 /// One unit's `ls2` line, as its State document; `Err` says why it cannot be used.
 pub fn parse_line(line: &str) -> Result<TargetState, String> {
+    parse_line_scaled(line).map(|(state, _)| state)
+}
+
+/// One unit's `ls2` line, as its State document, and the scale its setpoint is in.
+pub fn parse_line_scaled(line: &str) -> Result<(TargetState, Scale), String> {
     let fields: Vec<&str> = line.split_whitespace().collect();
     let [unit, power, setpoint, room, fan, mode, failure, filter, demand] = fields[..] else {
         return Err(format!("{} fields, not 9", fields.len()));
@@ -117,8 +130,8 @@ pub fn parse_line(line: &str) -> Result<TargetState, String> {
         "OFF" => false,
         other => return Err(format!("power `{other}`")),
     };
-    let target_temperature = temperature(setpoint)?;
-    let room = temperature(room)?;
+    let (target_temperature, scale) = temperature(setpoint)?;
+    let (room, _) = temperature(room)?;
     let fan = FAN_SPEEDS.iter().find(|(_, word, _)| *word == fan).map(|(value, _, _)| *value).ok_or(format!("fan speed `{fan}`"))?;
     let mode = MODES.iter().find(|(value, _)| *value == mode).map(|(value, _)| *value).ok_or(format!("mode `{mode}`"))?;
     // The code exactly as the CoolMaster prints it: vendor codes are often alphanumeric (`A3`,
@@ -147,7 +160,7 @@ pub fn parse_line(line: &str) -> Result<TargetState, String> {
     values.insert(FAILURE_CODE.into(), failure);
     values.insert(FILTER_CHANGE.into(), Value::from(filter));
     values.insert(DEMAND.into(), Value::from(demand));
-    Ok(TargetState::new(unit, values))
+    Ok((TargetState::new(unit, values), scale))
 }
 
 /// A listing line that cannot be used, and why.
@@ -164,6 +177,8 @@ pub struct BadLine {
 pub struct Listing {
     pub states: Vec<TargetState>,
     pub bad: Vec<BadLine>,
+    /// The scale each usable unit's temperatures were listed in.
+    pub scales: std::collections::BTreeMap<String, Scale>,
 }
 
 impl Listing {
@@ -184,8 +199,11 @@ impl Listing {
 pub fn parse_listing(body: &str) -> Listing {
     let mut listing = Listing::default();
     for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        match parse_line(line) {
-            Ok(state) => listing.states.push(state),
+        match parse_line_scaled(line) {
+            Ok((state, scale)) => {
+                listing.scales.insert(state.target.clone(), scale);
+                listing.states.push(state);
+            }
             Err(why) => {
                 let unit = line.split_whitespace().next().unwrap_or(line).to_owned();
                 listing.bad.push(BadLine { unit, line: line.to_owned(), why });
@@ -228,7 +246,7 @@ fn rank(property: &str, values: &PropertyMap) -> u8 {
 }
 
 /// The command that sets `property` of `unit` (an address already checked) to `value`.
-fn command(unit: &str, property: &str, value: &Value) -> Result<String, OpError> {
+fn command(unit: &str, property: &str, value: &Value, scale: Scale) -> Result<String, OpError> {
     let refuse = |what: &str| Err(OpError::Rejected(format!("`{property}` takes {what}, not {value}")));
     match property {
         POWER => match value {
@@ -245,7 +263,7 @@ fn command(unit: &str, property: &str, value: &Value) -> Result<String, OpError>
             None => refuse("VLow, Low, Medium, High, Top or Auto"),
         },
         TARGET_TEMPERATURE => match value.as_f64() {
-            Some(t) if SETPOINT_RANGE.contains(&t) => Ok(format!("temp {unit} {}", setpoint(t))),
+            Some(t) if SETPOINT_RANGE.contains(&t) => Ok(format!("temp {unit} {}", setpoint(t, scale))),
             _ => refuse("a number of °C from 0 to 50"),
         },
         other => Err(OpError::Unsupported(format!("`{other}` is not a property a request can set"))),
@@ -255,9 +273,14 @@ fn command(unit: &str, property: &str, value: &Value) -> Result<String, OpError>
 /// The setpoints a request may ask, in °C; the CoolMaster refuses what its unit cannot take.
 pub const SETPOINT_RANGE: std::ops::RangeInclusive<f64> = 0.0..=50.0;
 
-/// A setpoint as the CoolMaster takes it: at its step, 0.1°, with one decimal (`21.7`) — as v1
-/// sent it, and never the noise of float arithmetic (`21.700000000000003`).
-fn setpoint(t: f64) -> String {
+/// A setpoint (°C) as the CoolMaster takes it: in the unit's own scale, at its step, 0.1°, with
+/// one decimal (`21.7`) — as v1 sent it, and never the noise of float arithmetic
+/// (`21.700000000000003`).
+fn setpoint(celsius: f64, scale: Scale) -> String {
+    let t = match scale {
+        Scale::Celsius => celsius,
+        Scale::Fahrenheit => celsius * 9.0 / 5.0 + 32.0,
+    };
     format!("{:.1}", (t * 10.0).round() / 10.0)
 }
 
@@ -271,12 +294,18 @@ fn setpoint(t: f64) -> String {
 ///
 /// A property this bridge does not know is `Unsupported`, and a value outside its property's
 /// vocabulary `Rejected` — each in its own step, so the rest still applies. A target that is not
-/// a unit address refuses the whole request.
+/// a unit address refuses the whole request. A unit's setpoint is sent in °C; see [`plan_scaled`].
 pub fn plan(unit: &str, values: &PropertyMap) -> Result<Vec<Step>, OpError> {
+    plan_scaled(unit, values, Scale::Celsius)
+}
+
+/// [`plan`], for a unit whose temperatures are in `scale` at the CoolMaster: a setpoint, asked in
+/// °C, is sent in that scale (a unit whose scale is not known yet is taken for °C).
+pub fn plan_scaled(unit: &str, values: &PropertyMap, scale: Scale) -> Result<Vec<Step>, OpError> {
     let unit = unit_address(unit)?;
     let mut properties: Vec<&String> = values.keys().collect();
     properties.sort_by_key(|p| (rank(p, values), p.as_str()));
-    Ok(properties.into_iter().map(|p| Step { property: p.clone(), command: command(unit, p, &values[p.as_str()]) }).collect())
+    Ok(properties.into_iter().map(|p| Step { property: p.clone(), command: command(unit, p, &values[p.as_str()], scale) }).collect())
 }
 
 #[cfg(test)]

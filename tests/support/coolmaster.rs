@@ -39,12 +39,15 @@ pub struct Unit {
     pub failure: Option<&'static str>,
     pub filter: bool,
     pub demand: bool,
+    /// The unit's temperatures, `setpoint` and `room`, and what `temp` sets, are in °F.
+    pub fahrenheit: bool,
 }
 
 impl Unit {
     fn line(&self, unit: &str) -> String {
+        let scale = if self.fahrenheit { "F" } else { "C" };
         format!(
-            "{unit} {} {:.1}C {:.1}C {} {} {} {} {}",
+            "{unit} {} {:.1}{scale} {:.1}{scale} {} {} {} {} {}",
             if self.power { "ON" } else { "OFF" },
             self.setpoint,
             self.room,
@@ -62,11 +65,31 @@ pub fn units() -> BTreeMap<String, Unit> {
     BTreeMap::from([
         (
             "L1.001".to_owned(),
-            Unit { power: false, setpoint: 22.0, room: 25.0, fan: "High", mode: "Cool", failure: None, filter: false, demand: false },
+            Unit {
+                power: false,
+                setpoint: 22.0,
+                room: 25.0,
+                fan: "High",
+                mode: "Cool",
+                failure: None,
+                filter: false,
+                demand: false,
+                fahrenheit: false,
+            },
         ),
         (
             "L1.002".to_owned(),
-            Unit { power: true, setpoint: 24.0, room: 21.5, fan: "Low", mode: "Heat", failure: None, filter: true, demand: true },
+            Unit {
+                power: true,
+                setpoint: 24.0,
+                room: 21.5,
+                fan: "Low",
+                mode: "Heat",
+                failure: None,
+                filter: true,
+                demand: true,
+                fahrenheit: false,
+            },
         ),
     ])
 }
@@ -276,7 +299,8 @@ fn reply(shared: &Shared, command: &str) -> String {
                 ("auto", []) => state.mode = "Auto",
                 ("filt", []) => state.filter = false,
                 ("temp", [t]) => match t.parse::<f64>() {
-                    Ok(t) if (10.0..=35.0).contains(&t) => state.setpoint = t,
+                    // The unit's own scale: 10–35 °C, 50–95 °F.
+                    Ok(t) if (if state.fahrenheit { 50.0..=95.0 } else { 10.0..=35.0 }).contains(&t) => state.setpoint = t,
                     _ => return "ERROR: 4\r\n".to_owned(),
                 },
                 ("fspeed", [speed]) => {

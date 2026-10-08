@@ -136,6 +136,17 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib
 expect_text = '''was not refused'''
 guard       = "setpoint_range"
 
+# A °C setpoint sent to a °F unit as is, as v1 sent it: 23 °C read as 23 °F.
+[[control]]
+name        = "a_fahrenheit_unit_gets_celsius"
+file        = "src/protocol.rs"
+anchor      = '''        Scale::Fahrenheit => celsius * 9.0 / 5.0 + 32.0,'''
+replacement = '''        Scale::Fahrenheit => celsius,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_in_fahrenheit_gets_its_setpoint_in_fahrenheit", "--exact"]
+expect_text = '''a °C setpoint was not sent to a °F unit in °F'''
+guard       = "fahrenheit_setpoint"
+
 # A property that fails on its own ends the apply: a refused setpoint costs the power-off sent
 # after it.
 [[control]]

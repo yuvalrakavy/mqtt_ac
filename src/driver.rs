@@ -94,6 +94,9 @@ pub struct Coolmaster {
     passed_over: BTreeSet<String>,
     /// The units the full listings have named, for telling one gone (see [`Coolmaster::gone`]).
     known: BTreeMap<String, Known>,
+    /// Each unit's scale at the CoolMaster, from its last usable line: a setpoint for a unit in
+    /// °F goes in °F. A unit not listed yet is taken for °C.
+    scales: BTreeMap<String, protocol::Scale>,
 }
 
 /// A unit the full listings have named.
@@ -119,6 +122,7 @@ impl Coolmaster {
             operation_bound: info().timing.operation,
             passed_over: BTreeSet::new(),
             known: BTreeMap::new(),
+            scales: BTreeMap::new(),
         }
     }
 
@@ -170,6 +174,7 @@ impl Coolmaster {
         });
         for unit in &gone {
             self.passed_over.remove(unit);
+            self.scales.remove(unit);
         }
         gone
     }
@@ -354,6 +359,7 @@ impl DeviceDriver for Coolmaster {
         let body = self.exchange(&command).await?;
         let listing = protocol::parse_listing(&body);
         self.note(&listing);
+        self.scales.extend(listing.scales.iter().map(|(unit, scale)| (unit.clone(), *scale)));
         if unit.is_none() {
             for unit in self.gone(&listing) {
                 info!(unit = %unit, "A unit is no longer listed by the CoolMaster; its State is retracted");
@@ -375,7 +381,8 @@ impl DeviceDriver for Coolmaster {
         let started = Instant::now();
         let mut failed = Vec::new();
         let mut sent = false;
-        for step in protocol::plan(target, values)? {
+        let scale = self.scales.get(target).copied().unwrap_or(protocol::Scale::Celsius);
+        for step in protocol::plan_scaled(target, values, scale)? {
             let done = match step.command {
                 Ok(command) => {
                     sent = true;

@@ -392,3 +392,39 @@ async fn a_read_back_that_finds_the_link_dead_reports_it_lost() {
     assert!(h.errors().is_empty(), "a confirmed command was reported failed: {:?}", h.errors());
     assert!(h.stop().await);
 }
+
+/// A unit the CoolMaster reads in °F: its State is in °C, as every unit's, and a setpoint the
+/// Store asks in °C goes to it in °F (23 °C as `temp 73.4`) — never as 23 °F, which the unit
+/// would refuse or take for a near-freezing setpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unit_in_fahrenheit_gets_its_setpoint_in_fahrenheit() {
+    let h = Harness::start_prepared("fahrenheit", quick(None), |coolmaster| {
+        coolmaster.change("L1.001", |unit| {
+            unit.fahrenheit = true;
+            unit.setpoint = 72.0;
+            unit.room = 77.0;
+        });
+    })
+    .await;
+    assert!(h.connected().await);
+    assert_eq!(h.state("L1.001").unwrap()["temperature"], 25.0, "a °F reading was not shown in °C");
+    let before = h.coolmaster.commands().len();
+    assert!(h.desire("L1.001", "target_temperature", json!(23), REQUEST));
+    assert!(
+        h.eventually(BOUND, |h| h.coolmaster.commands_since(before).iter().any(|c| c.starts_with("temp "))).await,
+        "no setpoint was sent: {:?}",
+        h.coolmaster.commands()
+    );
+    let sent: Vec<String> = h.coolmaster.commands_since(before).into_iter().filter(|c| c.starts_with("temp ")).collect();
+    assert_eq!(sent, ["temp L1.001 73.4"], "a °C setpoint was not sent to a °F unit in °F");
+    assert!(
+        h.eventually(BOUND, |h| h
+            .state("L1.001")
+            .is_some_and(|s| s["target_temperature"].as_f64().is_some_and(|t| (t - 23.0).abs() < 0.01)))
+            .await,
+        "the unit's State did not follow in °C: {:?}",
+        h.state("L1.001")
+    );
+    assert!(h.errors().is_empty(), "{:?}", h.errors());
+    assert!(h.stop().await);
+}

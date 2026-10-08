@@ -186,6 +186,21 @@ fn a_setpoint_is_rounded_to_the_coolmasters_step_and_kept_in_range() {
     }
 }
 
+/// A unit's scale is the one its setpoint is listed in; a setpoint asked in °C goes to a unit in
+/// °F in °F, at the same step (23 °C as `73.4`, 21.7 °C as `71.1`), still checked in °C.
+#[test]
+fn a_setpoint_goes_in_the_units_own_scale() {
+    let listing = parse_listing("L1.001 ON 72.0F 77.0F High Cool OK - 0\r\nL1.002 ON 22.0C 25.0C High Cool OK - 0");
+    assert_eq!(listing.scales.get("L1.001"), Some(&Scale::Fahrenheit));
+    assert_eq!(listing.scales.get("L1.002"), Some(&Scale::Celsius));
+    let sent =
+        |value: Value| plan_scaled("L1.001", &map(json!({ "target_temperature": value })), Scale::Fahrenheit).unwrap()[0].command.clone();
+    assert_eq!(sent(json!(23)), Ok("temp L1.001 73.4".to_owned()), "a °C setpoint was not sent to a °F unit in °F");
+    assert_eq!(sent(json!(21.7)), Ok("temp L1.001 71.1".to_owned()));
+    assert!(matches!(sent(json!(60)), Err(OpError::Rejected(_))), "a setpoint out of range in °C was sent in °F");
+    assert_eq!(commands("L1.001", json!({"target_temperature": 23})), ok(&["temp L1.001 23.0"]));
+}
+
 /// An `apply`'s commands go in the order the CoolMaster needs: power on first; the mode before the
 /// setpoint and the fan speed; power off last.
 #[test]
