@@ -105,6 +105,8 @@ pub enum Answer {
     Close,
     /// The usual answer, once the test lets it go (`open_gate`).
     Gated,
+    /// A reply that never ends: 100 KiB with no prompt, then nothing, the connection held open.
+    Flood,
 }
 
 struct Rule {
@@ -346,6 +348,11 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
         }
         let reply = match answer {
             Some(Answer::Close) => return,
+            Some(Answer::Flood) => {
+                let _ = wr.write_all(&vec![b'x'; 100 * 1024]).await;
+                std::future::pending::<()>().await;
+                return;
+            }
             Some(Answer::Unusable) => b"\xff\xfe\r\nOK\r\n>".to_vec(),
             Some(Answer::Rejected) => b"ERROR: 1\r\n>".to_vec(),
             None | Some(Answer::Gated) => format!("{}>", reply(&shared, &command)).into_bytes(),

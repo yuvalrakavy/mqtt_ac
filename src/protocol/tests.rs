@@ -18,14 +18,14 @@ fn ok(lines: &[&str]) -> Vec<Result<String, OpError>> {
 }
 
 /// A reply's status decides it: `OK` (and `ERROR: 0`, as v1 had it) is success, with the body;
-/// any other status is the CoolMaster refusing the command — `Rejected`, which keeps the link up.
+/// an `ERROR` status is the CoolMaster refusing the command — `Rejected`, which keeps the link up.
 #[test]
 fn an_error_status_is_a_rejection_and_ok_is_success() {
     assert_eq!(parse_reply(b"OK\r\n"), Ok(String::new()));
     assert_eq!(parse_reply(b"ERROR: 0\r\n"), Ok(String::new()));
     assert_eq!(parse_reply(b"L1.001 ON 22.0C 25.0C High Cool OK - 0\r\nOK\r\n"), Ok("L1.001 ON 22.0C 25.0C High Cool OK - 0".to_owned()));
     assert_eq!(parse_reply(b"a\r\nb\r\nOK\r\n"), Ok("a\r\nb".to_owned()));
-    for refused in [&b"ERROR: 1\r\n"[..], b"ERROR: 3", b"Unknown command\r\n", b"body\r\nERROR: 2\r\n"] {
+    for refused in [&b"ERROR: 1\r\n"[..], b"ERROR: 3", b"body\r\nERROR: 2\r\n"] {
         assert!(
             matches!(parse_reply(refused), Err(OpError::Rejected(_))),
             "{:?} was not a rejection: {:?}",
@@ -35,11 +35,14 @@ fn an_error_status_is_a_rejection_and_ok_is_success() {
     }
 }
 
-/// A reply that cannot be read — not text, or no status at all — is `Unusable`: reported and
-/// passed over, never a reason to reconnect.
+/// A reply that cannot be read — not text, or no status at all, empty or not — is `Unusable`:
+/// reported and passed over, never a reason to reconnect, and never taken for the CoolMaster's
+/// refusal.
 #[test]
 fn a_reply_that_cannot_be_read_is_unusable() {
-    for unusable in [&b"\xff\xfe\r\nOK\r\n"[..], b"", b"\r\n", b"  "] {
+    for unusable in
+        [&b"\xff\xfe\r\nOK\r\n"[..], b"", b"\r\n", b"  ", b"Unknown command\r\n", b"L1.001 ON 22.0C 25.0C High Cool OK - 0\r\n", b"a\r\nb"]
+    {
         assert!(
             matches!(parse_reply(unusable), Err(OpError::Unusable(_))),
             "{:?} was not unusable: {:?}",
@@ -109,6 +112,8 @@ fn a_line_that_does_not_parse_says_why() {
         "L1.001 ON 22.0K 25.0C High Cool OK - 0",
         "L1.001 ON NaNC 25.0C High Cool OK - 0",
         "L1.001 ON infC 25.0C High Cool OK - 0",
+        "L1.001 ON 1e308F 25.0C High Cool OK - 0",
+        "L1.001 ON 22.0C -1e308F High Cool OK - 0",
         "L1.001 ON 22.0C 25.0C Turbo Cool OK - 0",
         "L1.001 ON 22.0C 25.0C High Freeze OK - 0",
         "L1.001 ON 22.0C 25.0C High Cool OK x 0",

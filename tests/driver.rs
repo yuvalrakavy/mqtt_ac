@@ -183,6 +183,30 @@ async fn a_request_held_through_a_lost_link_is_applied_on_recovery() {
     assert!(h.stop().await);
 }
 
+/// A reply far past any CoolMaster's (no prompt within 64 KiB) has lost its framing: the link is
+/// dropped as soon as the limit is read — not read on, buffered, until the operation's deadline —
+/// and the request is applied on the next connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_past_its_byte_limit_is_a_lost_link_at_once() {
+    let mut timing = quick(None);
+    timing.operation = Some(Duration::from_secs(3));
+    let h = Harness::start_with("flood", timing).await;
+    assert!(h.connected().await);
+    h.coolmaster.answer_once("on", Answer::Flood);
+    let asked = std::time::Instant::now();
+    assert!(h.desire("L1.001", "power", json!(true), REQUEST));
+    assert!(h.eventually(BOUND, |h| h.coolmaster.served() == 2).await, "the flooded link was never dropped");
+    let took = asked.elapsed();
+    assert!(took < Duration::from_millis(1500), "an over-long reply was read on until the operation's deadline: {took:?}");
+    assert!(
+        h.eventually(BOUND, |h| h.state("L1.001").is_some_and(|s| s["power"] == true)).await,
+        "the request was not applied after the reconnect: {:?}",
+        h.coolmaster.commands()
+    );
+    assert!(h.errors().is_empty(), "{:?}", h.errors());
+    assert!(h.stop().await);
+}
+
 /// A CoolMaster that closes the connection instead of answering a command has lost the link —
 /// not given an unusable answer: the request is held, and applied on the next connection, with
 /// no `Error`.

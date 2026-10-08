@@ -81,8 +81,9 @@ pub fn parse_reply(reply: &[u8]) -> Result<String, OpError> {
     };
     match status {
         "OK" | "ERROR: 0" => Ok(body.to_owned()),
-        "" => Err(OpError::Unusable("the CoolMaster's reply has no status".into())),
-        status => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),
+        status if status.starts_with("ERROR") => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),
+        // Neither `OK` nor an error: no status at all, empty or not — not a refusal either.
+        _ => Err(OpError::Unusable("the CoolMaster's reply has no status".into())),
     }
 }
 
@@ -104,11 +105,16 @@ fn temperature(text: &str) -> Result<(f64, Scale), String> {
     if !value.is_finite() {
         return Err(format!("`{text}` is not a temperature"));
     }
-    match scale {
-        Some('C') => Ok((value, Scale::Celsius)),
-        Some('F') => Ok(((value - 32.0) * 5.0 / 9.0, Scale::Fahrenheit)),
-        _ => Err(format!("`{text}` is not a temperature")),
+    let (celsius, scale) = match scale {
+        Some('C') => (value, Scale::Celsius),
+        Some('F') => ((value - 32.0) * 5.0 / 9.0, Scale::Fahrenheit),
+        _ => return Err(format!("`{text}` is not a temperature")),
+    };
+    // The conversion can overflow (`1e308F`): JSON has no infinity, and would say `null`.
+    if !celsius.is_finite() {
+        return Err(format!("`{text}` is not a temperature"));
     }
+    Ok((celsius, scale))
 }
 
 /// One unit's `ls2` line, as its State document; `Err` says why it cannot be used.

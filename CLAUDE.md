@@ -23,7 +23,7 @@ The contract (see `README.md` for the CoolMaster pair's topics and payloads):
 ## Build & Development
 
 ```bash
-cargo build                                              # the Pi (armv7-unknown-linux-musleabihf, .cargo/config.toml)
+cargo build --release                                    # the Pi (armv7-unknown-linux-musleabihf, .cargo/config.toml)
 cargo check --target armv7-unknown-linux-musleabihf      # the Pi, explicitly
 cargo test --target aarch64-apple-darwin                 # on the Mac
 cargo clippy --target aarch64-apple-darwin --all-targets # must EXIT 0 (deny-by-default lints are errors)
@@ -58,12 +58,15 @@ shutdown, the exit status), and logging. This crate keeps only the CoolMaster:
   with `Bridge::require`; an address it cannot use is `Bridge::usage_error`, said by `usage_exit`).
 
 The runtime calls the driver one operation at a time, each under its deadline (an overrun is a lost
-link), so the driver has no timeouts of its own.
+link). The driver's one timeout of its own is the read-back after a command: within what the
+operation has left (`main` hands it `--operation-timeout`), so it never replaces the command's
+outcome; a read-back that fails or overruns drops the link and reports it lost (`LinkHandle`).
 
-**Error classes** (spec §4.3): an error status, an out-of-vocabulary value and a target that is not
-a unit address are `Rejected`; a reply that is not text or has no status, and a listing with no
-usable line, are `Unusable`; an unknown property or command is `Unsupported`; I/O, a closed
-connection and EOF before the prompt are `Link`.
+**Error classes** (spec §4.3): an `ERROR` status, an out-of-vocabulary or out-of-range value and a
+target that is not a unit address are `Rejected`; a reply that is not text or has no status (empty
+or not), and a listing with no usable line, are `Unusable`; an unknown property or command is
+`Unsupported`; I/O, a closed connection, EOF before the prompt and a prompt or reply past
+`MAX_REPLY` (64 KiB) are `Link`.
 
 Built against the runtime after its R1 gate (tracing-init `feat/bridge-runtime` 67afa2d):
 `execute` takes `Option<&str>` (`ResetFilter` with none is Rejected), `DriverInfo` is built with

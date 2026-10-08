@@ -20,7 +20,7 @@ use mqtt_bridge_kit::{
     CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkContext, LinkError, LinkHandle, OpError,
     PropertyFailure, PropertyMap, Reporter, Scope, TargetState, Timing, Value, Writes,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
@@ -111,6 +111,11 @@ struct Known {
 /// Usable full listings in a row that must omit a unit before it is taken for gone: one listing
 /// can be cut short or come mid-scan; two in a row (8 s at the default poll) say it left.
 pub const GONE_AFTER: u32 = 2;
+
+/// The most a prompt or a reply may be, in bytes, before its `>`: far past any CoolMaster's (a
+/// listing of hundreds of units is some tens of KiB at most). A reply past it has lost its
+/// framing — the link is dropped at once — and is never buffered on until the deadline.
+pub const MAX_REPLY: u64 = 64 * 1024;
 
 impl Coolmaster {
     pub fn new(address: Address) -> Coolmaster {
@@ -221,7 +226,10 @@ impl Coolmaster {
         link.get_mut().write_all(line.as_bytes()).await.map_err(lost)?;
         let mut reply = Vec::new();
         // WAIT: coolmaster-io
-        link.read_until(b'>', &mut reply).await.map_err(lost)?;
+        (&mut *link).take(MAX_REPLY).read_until(b'>', &mut reply).await.map_err(lost)?;
+        if reply.last() != Some(&b'>') && reply.len() as u64 >= MAX_REPLY {
+            return Err(OpError::Link(LinkError::new(format!("a reply of {MAX_REPLY} bytes and no prompt: its framing is lost"))));
+        }
         // A reply that ends without its prompt ended with the connection.
         if reply.pop() != Some(b'>') {
             return Err(OpError::Link(LinkError::new("the CoolMaster closed the connection")));
@@ -333,9 +341,13 @@ impl DeviceDriver for Coolmaster {
         let mut link = BufReader::new(stream);
         let mut prompt = Vec::new();
         // WAIT: coolmaster-io
-        link.read_until(b'>', &mut prompt).await?;
+        (&mut link).take(MAX_REPLY).read_until(b'>', &mut prompt).await?;
         if prompt.last() != Some(&b'>') {
-            return Err(LinkError::new("the CoolMaster closed the connection before its prompt"));
+            return Err(LinkError::new(if prompt.len() as u64 >= MAX_REPLY {
+                "the CoolMaster sent no prompt within its byte limit"
+            } else {
+                "the CoolMaster closed the connection before its prompt"
+            }));
         }
         self.link = Some(link);
         Ok(())

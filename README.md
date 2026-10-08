@@ -37,10 +37,14 @@ One process fronts one CoolMaster: the controller is the `{instance}`, an indoor
 | `{Root}/Event/{controller}` | bridge → Store | no | replies to commands that ask for one (`"kind": "reply"`) |
 | `{Root}/Error/{controller}` | bridge → Store | no | `{error, reason, target?, property?, command?}` |
 
-QoS 1 everywhere. Requests carry the Store's `RequestExpiry` as their MQTT message expiry and its
-`OutageConflict` as the user property `conflict` (a missing one is `DeviceWins`); the runtime holds a
-request while the CoolMaster is down, drops it at its expiry, and decides an outage conflict against
-what the unit was before.
+QoS 1 everywhere. The bridge takes both `Desired` forms. **The Store's S1 driver sends only the
+target-level form, not retained, with no message expiry and no `conflict`:** such a request made
+while the CoolMaster is down is held until it is back (no deadline), under `DeviceWins`, and one
+made while the bridge itself is down is lost. When the Store sends the per-property form, retained,
+with its `RequestExpiry` as the MQTT message expiry and its `OutageConflict` as the user property
+`conflict` (Store kit S2), the runtime also replays it after a bridge restart, drops it at its
+expiry, and decides an outage conflict against what the unit was before (a missing `conflict` is
+`DeviceWins`).
 
 ### The unit document (`State`)
 
@@ -121,7 +125,7 @@ SIGTERM and SIGINT stop it within its bound (`Active=false`, then DISCONNECT).
 ## Building and testing
 
 ```bash
-cargo build                                   # the Pi: armv7-unknown-linux-musleabihf (.cargo/config.toml)
+cargo build --release                         # the Pi: armv7-unknown-linux-musleabihf (.cargo/config.toml); install_to_pi copies this one
 cargo test --target aarch64-apple-darwin      # on the Mac
 cargo clippy --target aarch64-apple-darwin --all-targets
 ```
@@ -140,7 +144,7 @@ covered by its conformance suite; these cover the driver. Negative controls:
 | `Aircondition/Coolmaster/{ctrl}` `true`/`false` | `Status/{ctrl}` `connected` / `connecting` / `unreachable` |
 | `Command/{ctrl}`: `SetPower`, `TargetTemperature`, `SetMode`, `SetFanSpeed`, `ResetFilter` (`{"unit", "operation"}`) | `Desired/{ctrl}/{unit}[/{power \| target_temperature \| operation_mode \| fan_speed}]`; `Command` keeps only `ResetFilter` (`{"target", "command"}`) |
 | `Error/{ctrl}` retained, a bare string | not retained, `{error, reason, target, property?, command?}` |
-| a request while the CoolMaster is down: held only while the bridge runs | held to its expiry, also across a bridge restart (retained `Desired`), with the outage conflict rule |
+| a request while the CoolMaster is down: held only while the bridge runs | held (to its expiry, when the Store sends one); when the Store sends the retained per-property form (S2), also across a bridge restart, with the outage conflict rule |
 | one bad `ls2` line failed the whole listing | it costs only its own unit |
 | `failure_code` a number: an alphanumeric code (`A3`) made the line unusable | a string, exactly as the CoolMaster prints it, or `null` |
 | `Version/{ctrl}` `mqtt_ac: 0.2.1 (built at …)` | `Version/{ctrl}` `mqtt_ac 2.0.0`, retained |
