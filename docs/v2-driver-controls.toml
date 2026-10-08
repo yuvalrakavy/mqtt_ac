@@ -34,8 +34,8 @@
 [[control]]
 name        = "an_error_status_is_success"
 file        = "src/protocol.rs"
-anchor      = '''        status if status.starts_with("ERROR") => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),'''
-replacement = '''        status if status.starts_with("ERROR") => Ok(body.to_owned()),'''
+anchor      = '''        status => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),'''
+replacement = '''        _status => Ok(body.to_owned()),'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_rejected_value_is_an_error_and_the_rest_still_applies", "--exact"]
 expect_text = '''the refused setpoint got no Error'''
@@ -346,16 +346,29 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--tes
 expect_text = '''an over-long reply was read on until the operation's deadline'''
 guard       = "reply_byte_limit"
 
-# A reply with no status taken for the CoolMaster's refusal, as v1 had it.
+# An empty reply (no status at all) taken for the CoolMaster's refusal.
 [[control]]
 name        = "no_status_is_a_refusal"
 file        = "src/protocol.rs"
-anchor      = '''        status if status.starts_with("ERROR") =>'''
-replacement = '''        status if !status.is_empty() =>'''
+anchor      = '''        "" => Err(OpError::Unusable("the CoolMaster's reply has no status".into())),'''
+replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::a_reply_that_cannot_be_read_is_unusable", "--exact"]
 expect_text = '''was not unusable'''
 guard       = "no_status_is_unusable"
+
+# A firmware's textual refusal (`Unknown command`) taken for an unusable reply (re-gate R4): the
+# Store hears `unusable`, and the WARN `command_rejected` is an INFO.
+[[control]]
+name        = "a_textual_refusal_is_unusable"
+file        = "src/protocol.rs"
+anchor      = '''        status => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),'''
+replacement = '''        status if status.starts_with("ERROR") => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),
+        _ => Err(OpError::Unusable("the CoolMaster's reply has no status".into())),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "protocol::tests::an_error_status_is_a_rejection_and_ok_is_success", "--exact"]
+expect_text = '''was not a rejection'''
+guard       = "textual_refusal_rejected"
 
 # A °F reading converted without the finite check: `1e308F` becomes a `null` temperature.
 [[control]]

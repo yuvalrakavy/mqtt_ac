@@ -18,14 +18,18 @@ fn ok(lines: &[&str]) -> Vec<Result<String, OpError>> {
 }
 
 /// A reply's status decides it: `OK` (and `ERROR: 0`, as v1 had it) is success, with the body;
-/// an `ERROR` status is the CoolMaster refusing the command — `Rejected`, which keeps the link up.
+/// any other text is the CoolMaster refusing the command, as v1 took it — `ERROR: n`, or a
+/// firmware's words (`Unknown command`, `Unsupported Feature`) — `Rejected`, which keeps the
+/// link up.
 #[test]
 fn an_error_status_is_a_rejection_and_ok_is_success() {
     assert_eq!(parse_reply(b"OK\r\n"), Ok(String::new()));
     assert_eq!(parse_reply(b"ERROR: 0\r\n"), Ok(String::new()));
     assert_eq!(parse_reply(b"L1.001 ON 22.0C 25.0C High Cool OK - 0\r\nOK\r\n"), Ok("L1.001 ON 22.0C 25.0C High Cool OK - 0".to_owned()));
     assert_eq!(parse_reply(b"a\r\nb\r\nOK\r\n"), Ok("a\r\nb".to_owned()));
-    for refused in [&b"ERROR: 1\r\n"[..], b"ERROR: 3", b"body\r\nERROR: 2\r\n"] {
+    for refused in
+        [&b"ERROR: 1\r\n"[..], b"ERROR: 3", b"body\r\nERROR: 2\r\n", b"Unknown command\r\n", b"Unsupported Feature\r\n", b"a\r\nb"]
+    {
         assert!(
             matches!(parse_reply(refused), Err(OpError::Rejected(_))),
             "{:?} was not a rejection: {:?}",
@@ -35,14 +39,11 @@ fn an_error_status_is_a_rejection_and_ok_is_success() {
     }
 }
 
-/// A reply that cannot be read — not text, or no status at all, empty or not — is `Unusable`:
-/// reported and passed over, never a reason to reconnect, and never taken for the CoolMaster's
-/// refusal.
+/// A reply that cannot be read — not text, or empty — is `Unusable`: reported and passed over,
+/// never a reason to reconnect, and never taken for the CoolMaster's refusal.
 #[test]
 fn a_reply_that_cannot_be_read_is_unusable() {
-    for unusable in
-        [&b"\xff\xfe\r\nOK\r\n"[..], b"", b"\r\n", b"  ", b"Unknown command\r\n", b"L1.001 ON 22.0C 25.0C High Cool OK - 0\r\n", b"a\r\nb"]
-    {
+    for unusable in [&b"\xff\xfe\r\nOK\r\n"[..], b"", b"\r\n", b"  "] {
         assert!(
             matches!(parse_reply(unusable), Err(OpError::Unusable(_))),
             "{:?} was not unusable: {:?}",

@@ -81,9 +81,10 @@ pub fn parse_reply(reply: &[u8]) -> Result<String, OpError> {
     };
     match status {
         "OK" | "ERROR: 0" => Ok(body.to_owned()),
-        status if status.starts_with("ERROR") => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),
-        // Neither `OK` nor an error: no status at all, empty or not — not a refusal either.
-        _ => Err(OpError::Unusable("the CoolMaster's reply has no status".into())),
+        "" => Err(OpError::Unusable("the CoolMaster's reply has no status".into())),
+        // Any other text is the CoolMaster refusing, as v1 took it: `ERROR: n`, or a firmware's
+        // words (`Unknown command` in verbose mode, `Unsupported Feature`).
+        status => Err(OpError::Rejected(format!("the CoolMaster answered `{status}`"))),
     }
 }
 

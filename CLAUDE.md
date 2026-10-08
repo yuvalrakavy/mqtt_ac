@@ -62,9 +62,10 @@ link). The driver's one timeout of its own is the read-back after a command: wit
 operation has left (`main` hands it `--operation-timeout`), so it never replaces the command's
 outcome; a read-back that fails or overruns drops the link and reports it lost (`LinkHandle`).
 
-**Error classes** (spec §4.3): an `ERROR` status, an out-of-vocabulary or out-of-range value and a
-target that is not a unit address are `Rejected`; a reply that is not text or has no status (empty
-or not), and a listing with no usable line, are `Unusable`; an unknown property or command is
+**Error classes** (spec §4.3): any status but `OK` (`ERROR: n`, or a firmware's words such as
+`Unknown command`, as v1 took them), an out-of-vocabulary or out-of-range value, a setpoint for a
+unit whose scale cannot be learnt, and a target that is not a unit address are `Rejected`; a reply
+that is not text or is empty, and a listing with no usable line, are `Unusable`; an unknown property or command is
 `Unsupported`; I/O, a closed connection, EOF before the prompt and a prompt or reply past
 `MAX_REPLY` (64 KiB) are `Link`.
 
