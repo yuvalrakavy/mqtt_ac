@@ -286,3 +286,46 @@ async fn a_unit_gone_from_the_listing_has_its_state_retracted() {
     );
     assert!(h.stop().await);
 }
+
+/// A line whose unit address itself is garbled says nothing about which unit it was: no unit is
+/// retracted for it, and the garbage never becomes a topic of its own — neither while it lasts nor
+/// once the line is clean again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_garbled_unit_address_retracts_nothing() {
+    let h = Harness::start_with("garble", quick(Some(Duration::from_millis(200)))).await;
+    assert!(h.connected().await);
+    let topic = h.topics.state("L1.002");
+    h.coolmaster.set_line("L1.002", Some("L1.0\u{1}2 ON 24.0C ??? Low Heat OK # 1"));
+    h.settle(Duration::from_millis(1000)).await;
+    assert!(
+        h.broker.retained_on(&topic).is_some_and(|p| !p.is_empty()),
+        "a unit was retracted because its address was listed garbled: {:?}",
+        h.broker.received_on(&topic).last()
+    );
+    h.coolmaster.set_line("L1.002", None);
+    h.settle(Duration::from_millis(1000)).await;
+    let ghost = h.topics.state("L1.0\u{1}2");
+    assert!(h.broker.received_on(&ghost).is_empty(), "a garbled address was published as a unit: {:?}", h.broker.received_on(&ghost));
+    assert!(h.broker.retained_on(&topic).is_some_and(|p| !p.is_empty()));
+    assert!(h.stop().await);
+}
+
+/// A listing that says nothing usable about the units — empty (a CoolMaster rebooting, or still
+/// scanning its line), or with no line that can be read — retracts no unit, however long it lasts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_or_unusable_listing_retracts_nothing() {
+    let h = Harness::start_with("emptylist", quick(Some(Duration::from_millis(200)))).await;
+    assert!(h.connected().await);
+    let retained = |h: &Harness| ["L1.001", "L1.002"].map(|u| h.broker.retained_on(&h.topics.state(u)).is_some_and(|p| !p.is_empty()));
+    let a = h.coolmaster.remove_unit("L1.001").unwrap();
+    let b = h.coolmaster.remove_unit("L1.002").unwrap();
+    h.settle(Duration::from_millis(1000)).await;
+    assert_eq!(retained(&h), [true, true], "an empty listing retracted units");
+    h.coolmaster.add_unit("L1.001", a);
+    h.coolmaster.add_unit("L1.002", b);
+    h.coolmaster.set_line("L1.001", Some("garbage"));
+    h.coolmaster.set_line("L1.002", Some("more garbage"));
+    h.settle(Duration::from_millis(1000)).await;
+    assert_eq!(retained(&h), [true, true], "a listing with no usable line retracted units");
+    assert!(h.stop().await);
+}
