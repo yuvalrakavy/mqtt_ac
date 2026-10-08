@@ -38,6 +38,7 @@ waits on nothing but the CoolMaster, and the runtime's deadline bounds that.
 | Key | Kind | Waits on | Argument |
 |---|---|---|---|
 | `coolmaster-io` | bounded | the CoolMaster, over TCP: a connect and its first prompt, or a command's write and its reply up to the next prompt | The runtime's deadline on the driver operation it is part of: `connect` (10 s, `--connect-timeout`) for the connect and its prompt; every other operation (10 s, `--operation-timeout`) for an `ls2`, or for an `apply`'s commands and its read-back together. On expiry the runtime drops the operation's future, mid-exchange if need be, takes it for a lost link — it calls `disconnect`, which drops the connection, holds the state requests, refuses the momentary ones — and reconnects at most once per retry interval (5 s). Nothing in the driver waits on the runtime, so the bound is the whole of it. A name lookup of the CoolMaster's host runs on the worker runtime's blocking pool, and is abandoned with it at the deadline (Bridge Runtime spec §4.2, §5). |
+| `coolmaster-read-back` | bounded | the read-back (`ls2 <unit>`) after a confirmed command or `apply` | What the operation has left of its bound (`--operation-timeout`, which `main` hands the driver), less a fifth of it, so the runtime's own deadline never falls inside it and the read-back can never replace the command's outcome. On expiry the exchange is cut midway: the driver drops the connection (its state unknown), reports the link lost through its `LinkHandle`, and returns the command's own outcome; the runtime then reconnects at its paced rate. With no time left, the read-back is skipped for the next poll. |
 
 ## Settings
 
@@ -51,4 +52,5 @@ not-waits = sleep, sleep_until, yield_now
 ```wait-lint-waiters
 coolmaster-io src/driver.rs <Coolmaster as DeviceDriver>::connect
 coolmaster-io src/driver.rs Coolmaster::exchange_raw
+coolmaster-read-back src/driver.rs Coolmaster::read_back
 ```

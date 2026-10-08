@@ -179,16 +179,51 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib
 expect_text = '''was planned'''
 guard       = "unit_address_guard"
 
-# No read-back after a command: with polling off, the unit's State never follows.
+# No read-back after a write: with polling off, the unit's State never follows.
 [[control]]
 name        = "no_read_back_after_a_command"
 file        = "src/driver.rs"
-anchor      = '''            self.read_back(target).await;'''
-replacement = '''            let _ = target;'''
+anchor      = '''            self.read_back(target, started).await;'''
+replacement = '''            let _ = (target, started);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_property_write_becomes_its_command", "--exact"]
 expect_text = '''the unit's State did not follow'''
 guard       = "read_back_after_a_command"
+
+# No read-back after ResetFilter: with polling off, `filter_change` never follows.
+[[control]]
+name        = "no_read_back_after_reset_filter"
+file        = "src/driver.rs"
+anchor      = '''        self.read_back(unit, started).await;'''
+replacement = '''        let _ = (unit, started);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "reset_filter_resets_the_units_filter", "--exact"]
+expect_text = '''the filter flag was not reset'''
+guard       = "read_back_after_reset_filter"
+
+# The read-back inside the operation's deadline, as before the review: a stall in it turns the
+# confirmed command into `link_lost`.
+[[control]]
+name        = "the_read_back_has_no_bound_of_its_own"
+file        = "src/driver.rs"
+anchor      = '''        let read = tokio::time::timeout(budget, self.read_state(Scope::Target(unit.to_owned()))).await;'''
+replacement = '''        let read: Result<_, tokio::time::error::Elapsed> = Ok(self.read_state(Scope::Target(unit.to_owned())).await);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_stalled_read_back_leaves_a_confirmed_command_confirmed", "--exact"]
+expect_text = '''a confirmed command was reported failed'''
+guard       = "read_back_bound"
+
+# A read-back that finds the link dead keeps it to itself: with polling off, the bridge stays
+# "connected" on a dead socket.
+[[control]]
+name        = "a_dead_read_back_is_not_reported"
+file        = "src/driver.rs"
+anchor      = '''            handle.link_lost(lost);'''
+replacement = '''            let _ = (handle, lost);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_read_back_that_finds_the_link_dead_reports_it_lost", "--exact"]
+expect_text = '''the bridge still says connected on a dead link'''
+guard       = "read_back_link_lost"
 
 # A unit gone from the listing left as last read: its retained State stays at the broker, a ghost.
 [[control]]

@@ -14,10 +14,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mqtt_bridge_kit::{
-    CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkContext, LinkError, OpError,
+    CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkContext, LinkError, LinkHandle, OpError,
     PropertyFailure, PropertyMap, Reporter, Scope, TargetState, Timing, Value, Writes,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -84,7 +84,12 @@ pub struct Coolmaster {
     link: Option<BufReader<TcpStream>>,
     /// Why the link was dropped between operations, for the next one to say.
     dropped: Option<String>,
-    report: Option<Reporter>,
+    /// The current link's handle: its reporter, and its `link_lost` for a read-back that finds the
+    /// link dead after its command was confirmed.
+    handle: Option<LinkHandle>,
+    /// The runtime's bound on each operation, as the command line set it: a read-back keeps within
+    /// what its operation has left (see [`Coolmaster::read_back`]).
+    operation_bound: Duration,
     /// The units whose listing line cannot be used now, as last said.
     passed_over: BTreeSet<String>,
     /// The units the full listings have named, for telling one gone (see [`Coolmaster::gone`]).
@@ -106,7 +111,26 @@ pub const GONE_AFTER: u32 = 2;
 
 impl Coolmaster {
     pub fn new(address: Address) -> Coolmaster {
-        Coolmaster { address, link: None, dropped: None, report: None, passed_over: BTreeSet::new(), known: BTreeMap::new() }
+        Coolmaster {
+            address,
+            link: None,
+            dropped: None,
+            handle: None,
+            operation_bound: info().timing.operation,
+            passed_over: BTreeSet::new(),
+            known: BTreeMap::new(),
+        }
+    }
+
+    /// The runtime's bound on each operation, when the command line changed it
+    /// (`--operation-timeout`): `main` passes the bridge's own.
+    pub fn operation_bound(mut self, bound: Duration) -> Coolmaster {
+        self.operation_bound = bound;
+        self
+    }
+
+    fn report(&self) -> Option<&Reporter> {
+        self.handle.as_ref().map(LinkHandle::report)
     }
 
     /// A full listing: the units now gone from the CoolMaster (unbound, or the controller set up
@@ -209,26 +233,51 @@ impl Coolmaster {
         let Some(unit) = unit else {
             return Err(OpError::Rejected(format!("`{}` names the unit it resets", protocol::RESET_FILTER)));
         };
+        let started = Instant::now();
         let command = protocol::reset_filter(unit)?;
         self.exchange(&command).await?;
-        self.read_back(unit).await;
+        self.read_back(unit, started).await;
         Ok(None)
     }
 
     /// After a command: read the unit back, so its `State` follows at once rather than at the next
-    /// poll. A courtesy — the command was confirmed already: a listing that is refused or
-    /// unusable waits for the poll, and a link lost here is dropped, for the next operation to
-    /// find.
-    async fn read_back(&mut self, unit: &str) {
-        match self.read_state(Scope::Target(unit.to_owned())).await {
-            Ok(states) => {
-                if let Some(report) = &self.report {
+    /// poll. Its outcome never replaces the command's own — the command was confirmed already — so
+    /// it has a bound of its own, within what the operation (begun at `started`) has left, less a
+    /// margin: the runtime's deadline on the operation never falls in it. A listing that is refused
+    /// or unusable waits for the poll. A link that fails here, or a read-back that overruns its
+    /// bound (the exchange cut midway, the connection in an unknown state), is dropped and reported
+    /// lost, so the runtime reconnects at once rather than at the next operation — with polling off,
+    /// that could be never.
+    async fn read_back(&mut self, unit: &str, started: Instant) {
+        let budget = self.operation_bound.saturating_sub(started.elapsed()).saturating_sub(self.operation_bound / 5);
+        if budget.is_zero() {
+            debug!(unit, "No time left for a unit's read-back after its command; the next poll reads it");
+            return;
+        }
+        // WAIT: coolmaster-read-back
+        let read = tokio::time::timeout(budget, self.read_state(Scope::Target(unit.to_owned()))).await;
+        let lost = match read {
+            Ok(Ok(states)) => {
+                if let Some(report) = self.report() {
                     for state in states {
                         report.state(&state.target, state.values, false);
                     }
                 }
+                return;
             }
-            Err(e) => debug!(unit, error = %e, "A unit's read-back after its command failed; the next poll reads it"),
+            Ok(Err(OpError::Link(e))) => e.reason().to_owned(),
+            Ok(Err(e)) => {
+                debug!(unit, error = %e, "A unit's read-back after its command failed; the next poll reads it");
+                return;
+            }
+            Err(_) => {
+                self.link = None;
+                format!("a unit's read-back after its command overran its bound ({} ms)", budget.as_millis())
+            }
+        };
+        self.dropped = Some(lost.clone());
+        if let Some(handle) = &self.handle {
+            handle.link_lost(lost);
         }
     }
 }
@@ -271,7 +320,7 @@ impl DeviceDriver for Coolmaster {
     async fn connect(&mut self, ctx: &mut LinkContext) -> Result<(), LinkError> {
         self.link = None;
         self.dropped = None;
-        self.report = Some(ctx.report.clone());
+        self.handle = Some(ctx.handle());
         let Address { host, port } = &self.address;
         // WAIT: coolmaster-io
         let stream = TcpStream::connect((host.as_str(), *port)).await?;
@@ -290,6 +339,7 @@ impl DeviceDriver for Coolmaster {
     async fn disconnect(&mut self) {
         self.link = None;
         self.dropped = None;
+        self.handle = None;
     }
 
     /// `ls2`: every unit (`Scope::All`, and `Scope::Any`), or one. A line that cannot be used costs
@@ -307,7 +357,7 @@ impl DeviceDriver for Coolmaster {
         if unit.is_none() {
             for unit in self.gone(&listing) {
                 info!(unit = %unit, "A unit is no longer listed by the CoolMaster; its State is retracted");
-                if let Some(report) = &self.report {
+                if let Some(report) = self.report() {
                     report.remove(&unit);
                 }
             }
@@ -322,6 +372,7 @@ impl DeviceDriver for Coolmaster {
     /// link ends it at once, and the runtime holds the request for the next connection. Then the
     /// unit is read back. A target that is not a unit address fails the whole write (`Rejected`).
     async fn apply(&mut self, target: &str, values: &PropertyMap) -> Result<(), OpError> {
+        let started = Instant::now();
         let mut failed = Vec::new();
         let mut sent = false;
         for step in protocol::plan(target, values)? {
@@ -339,7 +390,7 @@ impl DeviceDriver for Coolmaster {
             }
         }
         if sent {
-            self.read_back(target).await;
+            self.read_back(target, started).await;
         }
         outcome(failed)
     }

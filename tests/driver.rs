@@ -330,3 +330,65 @@ async fn an_empty_or_unusable_listing_retracts_nothing() {
     assert_eq!(retained(&h), [true, true], "a listing with no usable line retracted units");
     assert!(h.stop().await);
 }
+
+/// The read-back after a confirmed command has a bound of its own: a CoolMaster that stalls on
+/// it (mid-exchange, `Gated`) never turns the confirmed `ResetFilter` into a failure. The stalled
+/// link is dropped and reported lost, and the bridge reconnects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_read_back_leaves_a_confirmed_command_confirmed() {
+    let h = Harness::start("rbstall").await;
+    assert!(h.connected().await);
+    h.coolmaster.answer_once("ls2 L1.002", Answer::Gated);
+    assert!(h.command(json!({"target": "L1.002", "command": "ResetFilter"})));
+    assert!(
+        h.eventually(BOUND, |h| h.coolmaster.served() == 2 && h.status().as_deref() == Some("connected")).await,
+        "the stalled link was not dropped and reconnected: served {}, statuses {:?}",
+        h.coolmaster.served(),
+        h.statuses()
+    );
+    assert!(!h.coolmaster.unit("L1.002").unwrap().filter, "the filter was not reset");
+    assert!(h.errors().is_empty(), "a confirmed command was reported failed: {:?}", h.errors());
+    assert!(h.stop().await);
+}
+
+/// The same for a partly refused write: a stalled read-back keeps the write's own outcome — the
+/// refused setpoint's `Error`, the power-off applied — and the write is never applied again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_read_back_keeps_a_partial_writes_outcome() {
+    let h = Harness::start("rbpartial").await;
+    assert!(h.connected().await);
+    h.coolmaster.answer_once("ls2 L1.002", Answer::Gated);
+    assert!(h.desire_many("L1.002", json!({"target_temperature": 40, "power": false}), REQUEST));
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("L1.002", "target_temperature").first().is_some_and(|e| e["reason"] == "rejected")).await,
+        "the refused setpoint got no rejection: {:?}",
+        h.errors()
+    );
+    assert!(h.eventually(BOUND, |h| h.coolmaster.served() == 2 && h.status().as_deref() == Some("connected")).await);
+    h.settle(SETTLE).await;
+    let temps = h.coolmaster.commands().iter().filter(|c| c.starts_with("temp ")).count();
+    assert_eq!(temps, 1, "the write was applied again after its read-back stalled: {:?}", h.coolmaster.commands());
+    assert!(h.errors_for("L1.002", "power").is_empty(), "the applied power-off was reported failed: {:?}", h.errors());
+    assert!(!h.coolmaster.unit("L1.002").unwrap().power);
+    assert!(h.stop().await);
+}
+
+/// A read-back whose link closes, with polling off: the command stays confirmed, and the link is
+/// reported lost — the bridge never stays "connected" on a dead socket, waiting for a request to
+/// find out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_back_that_finds_the_link_dead_reports_it_lost() {
+    let h = Harness::start("rbclosed").await;
+    assert!(h.connected().await);
+    let statuses = h.statuses().len();
+    h.coolmaster.answer_once("ls2 L1.002", Answer::Close);
+    assert!(h.command(json!({"target": "L1.002", "command": "ResetFilter"})));
+    assert!(
+        h.eventually(BOUND, |h| h.statuses()[statuses..].iter().any(|s| s == "unreachable")).await,
+        "the bridge still says connected on a dead link: {:?}",
+        h.statuses()
+    );
+    assert!(h.eventually(BOUND, |h| h.coolmaster.served() == 2 && h.status().as_deref() == Some("connected")).await);
+    assert!(h.errors().is_empty(), "a confirmed command was reported failed: {:?}", h.errors());
+    assert!(h.stop().await);
+}

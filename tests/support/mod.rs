@@ -94,13 +94,14 @@ impl Harness {
         prepare(&coolmaster);
         let topics = Topics::new(ROOT, instance).expect("the test's topics");
         let address = Address::parse(&coolmaster.address).expect("the stand-in's address");
+        let operation = timing.apply(mqtt_ac::info().timing).operation;
         let running = Bridge::new(ROOT)
             .instance(instance)
             .broker(&broker.address())
             .timing(timing)
             .mqtt_timing(quick_mqtt())
             .version(VERSION)
-            .start(Coolmaster::new(address))
+            .start(Coolmaster::new(address).operation_bound(operation))
             .expect("the bridge starts");
         let harness = Harness { broker, coolmaster, topics, running: Some(running) };
         let command = harness.topics.command();

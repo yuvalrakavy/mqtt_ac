@@ -30,8 +30,10 @@ fn main() -> ExitCode {
     if let Some(code) = bridge.usage_exit() {
         return code;
     }
+    // The driver keeps its read-backs within the runtime's bound on each operation, as given here.
+    let operation = bridge.settings().timing.apply(mqtt_ac::info().timing).operation;
     match address {
-        Some(Ok(address)) => bridge.run(Coolmaster::new(address)),
+        Some(Ok(address)) => bridge.run(Coolmaster::new(address).operation_bound(operation)),
         // Not reached: without the option, `require` made it a usage error, said above.
         _ => ExitCode::from(2),
     }
