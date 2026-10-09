@@ -34,7 +34,7 @@ One process fronts one CoolMaster: the controller is the `{instance}`, an indoor
 | `{Root}/Desired/{controller}/{unit}` | Store → bridge | never | `{property: value, …}`: several at once |
 | `{Root}/Command/{controller}` | Store → bridge | never; 30 s expiry | `{"target": unit, "command": "ResetFilter"}`; the standard `refresh` and `assume` |
 | `{Root}/Config/{controller}/{unit}` | Store → bridge | yes | accepted; the CoolMaster needs no setup per unit |
-| `{Root}/Event/{controller}` | bridge → Store | no | replies to commands that ask for one (`"kind": "reply"`) |
+| `{Root}/Event/{controller}` | bridge → Store | no | `{"kind": "unit_lost_power", "target": unit}`, `{"kind": "unit_power_restored", "target": unit, "down_for_ms": N}`; replies to commands that ask for one (`"kind": "reply"`) |
 | `{Root}/Error/{controller}` | bridge → Store | no | `{error, reason, target?, property?, command?}` |
 
 QoS 1 everywhere. The bridge takes both `Desired` forms. **The Store's S1 driver sends only the
@@ -53,7 +53,7 @@ v1's field names and value strings, so the Store's driver maps them as it did:
 ```json
 {"unit": "L7.400", "power": true, "target_temperature": 23.5, "temperature": 24.1,
  "fan_speed": "High", "operation_mode": "Heat", "failure_code": null,
- "filter_change": false, "demand": true}
+ "filter_change": false, "demand": true, "powered": true}
 ```
 
 | Field | Values |
@@ -66,14 +66,18 @@ v1's field names and value strings, so the Store's driver maps them as it did:
 | `failure_code` | `null` when the unit is `OK`; otherwise the code exactly as the CoolMaster prints it, a string (`"A3"`, `"U4"`, `"12"`) |
 | `filter_change` | `true` when the filter wants changing |
 | `demand` | `true` / `false` |
+| `powered` | `true` in every document read from the CoolMaster; `false` once the unit has lost its power (below) |
 
-A unit the CoolMaster no longer lists has its `State` retracted (an empty retained payload); listed
-again, it is published again. Only once two usable full listings in a row have omitted it (8 s at
-the default poll; with `--poll off`, two connects or refreshes). An empty listing, one with no
-readable line, or one with a garbled unit address never retracts anything. A unit removed while
-the bridge was stopped is **not** retracted: the bridge's first listing has nothing to compare
-with, so its old State stays at the broker. A garble that still reads as an address (`L7.4O1` for
-`L7.401`) cannot be told from a real unit.
+**A unit the CoolMaster stops listing has lost its power** (owner, 2026-10-09) — normal life, not a
+unit gone: its `State` is never retracted. Once two usable full listings in a row have omitted it
+(8 s at the default poll; with `--poll off`, two connects or refreshes), its State is published
+with `"powered": false`, its last known values kept; one Event `unit_lost_power` and one WARN
+`unit_lost_power` per episode. Requests to it go out as usual; the CoolMaster's refusal is an
+`Error` for that property. Listed again, its State is fresh with `"powered": true`, with one Event
+`unit_power_restored` (`down_for_ms`) and an INFO. An empty listing, one with no readable line, or
+one with a garbled unit address never takes a unit for unpowered. A unit never listed since the
+bridge started stays as its retained State says: nothing new to report. A garble that still reads
+as an address (`L7.4O1` for `L7.401`) cannot be told from a real unit.
 
 ### What a request can set (`Desired`)
 

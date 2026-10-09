@@ -41,6 +41,9 @@ pub const TEMPERATURE: &str = "temperature";
 pub const FAILURE_CODE: &str = "failure_code";
 pub const FILTER_CHANGE: &str = "filter_change";
 pub const DEMAND: &str = "demand";
+/// Whether the unit has power: `true` in every document read from a listing; `false` once the
+/// CoolMaster no longer lists it (the driver's power-loss episode), its last values kept.
+pub const POWERED: &str = "powered";
 
 /// The one momentary command: reset a unit's filter flag (`filt <unit>`).
 pub const RESET_FILTER: &str = "ResetFilter";
@@ -167,6 +170,7 @@ pub fn parse_line_scaled(line: &str) -> Result<(TargetState, Scale), String> {
     values.insert(FAILURE_CODE.into(), failure);
     values.insert(FILTER_CHANGE.into(), Value::from(filter));
     values.insert(DEMAND.into(), Value::from(demand));
+    values.insert(POWERED.into(), Value::from(true));
     Ok((TargetState::new(unit, values), scale))
 }
 

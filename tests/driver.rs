@@ -291,46 +291,81 @@ async fn a_unit_in_failure_keeps_its_state_current() {
     assert!(h.stop().await);
 }
 
-/// A unit the CoolMaster no longer lists (unbound at the controller) has its retained `State`
-/// retracted — an empty retained payload — so the broker keeps no ghost of it; listed again, it is
-/// published again. The other unit is untouched.
+/// The `Event`s published, as JSON.
+fn events(h: &Harness) -> Vec<serde_json::Value> {
+    h.broker.received_on(&h.topics.event()).iter().filter_map(|r| serde_json::from_slice(&r.payload).ok()).collect()
+}
+
+/// A unit the CoolMaster no longer lists has lost its power (owner, 2026-10-09): it is never
+/// retracted. Its State says `"powered": false`, keeping its last values; one Event
+/// `unit_lost_power`. A request to it still goes out, and the CoolMaster's refusal is an `Error`
+/// for that property. Listed again, its State is fresh with `"powered": true`, and one Event
+/// `unit_power_restored` says how long it was down. The other unit is untouched.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_unit_gone_from_the_listing_has_its_state_retracted() {
-    let h = Harness::start_with("gone", quick(Some(Duration::from_millis(200)))).await;
+async fn a_unit_that_loses_power_is_reported_unpowered_and_restored() {
+    let h = Harness::start_with("powerloss", quick(Some(Duration::from_millis(200)))).await;
     assert!(h.connected().await);
-    let topic = h.topics.state("L1.002");
-    assert!(h.broker.retained_on(&topic).is_some_and(|p| !p.is_empty()));
     let unit = h.coolmaster.remove_unit("L1.002").expect("the stand-in's L1.002");
-    let retracted = h.eventually(BOUND, |h| h.broker.received_on(&topic).last().is_some_and(|r| r.payload.is_empty() && r.retain)).await;
     assert!(
-        retracted && h.broker.retained_on(&topic).is_none(),
-        "the State of a unit gone from the listing was not retracted: {:?}; retained: {:?}",
-        h.broker.received_on(&topic).last(),
-        h.broker.retained_on(&topic)
+        h.eventually(BOUND, |h| h.state("L1.002").is_some_and(|s| s["powered"] == false)).await,
+        "a unit that lost power was not reported unpowered: {:?}; retained: {:?}",
+        h.broker.received_on(&h.topics.state("L1.002")).last(),
+        h.broker.retained_on(&h.topics.state("L1.002"))
     );
-    assert!(h.broker.retained_on(&h.topics.state("L1.001")).is_some_and(|p| !p.is_empty()), "the unit still listed lost its State");
+    let state = h.state("L1.002").unwrap();
+    assert_eq!(
+        (state["operation_mode"].as_str(), state["target_temperature"].as_f64()),
+        (Some("Heat"), Some(24.0)),
+        "its last values were lost: {state}"
+    );
+    assert!(h.broker.received_on(&h.topics.state("L1.002")).iter().all(|r| !r.payload.is_empty()), "a unit that lost power was retracted");
+    assert!(
+        h.eventually(BOUND, |h| events(h).iter().any(|e| e["kind"] == "unit_lost_power")).await,
+        "no unit_lost_power Event: {:?}",
+        events(&h)
+    );
+    h.settle(Duration::from_millis(600)).await;
+    let lost: Vec<_> = events(&h).into_iter().filter(|e| e["kind"] == "unit_lost_power").collect();
+    assert_eq!(lost, [serde_json::json!({"kind": "unit_lost_power", "target": "L1.002"})], "not one Event per episode");
+    assert!(h.state("L1.001").is_some_and(|s| s["powered"] == true), "the unit still listed changed");
+    // A request to it goes out; the CoolMaster refuses it (it lists no such unit now).
+    assert!(h.desire("L1.002", "power", json!(false), REQUEST));
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("L1.002", "power").first().is_some_and(|e| e["reason"] == "rejected")).await,
+        "a request to an unpowered unit got no Error: {:?}",
+        h.errors()
+    );
+    assert!(h.coolmaster.commands().iter().any(|c| c == "off L1.002"), "a request to an unpowered unit was not sent");
     h.coolmaster.add_unit("L1.002", unit);
     assert!(
-        h.eventually(BOUND, |h| h.broker.retained_on(&topic).is_some_and(|p| !p.is_empty())).await,
-        "a unit listed again was not published again: {:?}",
-        h.broker.received_on(&topic).last()
+        h.eventually(BOUND, |h| h.state("L1.002").is_some_and(|s| s["powered"] == true)).await,
+        "a unit whose power came back was not reported powered: {:?}",
+        h.state("L1.002")
+    );
+    assert!(
+        h.eventually(BOUND, |h| events(h)
+            .iter()
+            .any(|e| e["kind"] == "unit_power_restored" && e["target"] == "L1.002" && e["down_for_ms"].is_u64()))
+            .await,
+        "no unit_power_restored Event: {:?}",
+        events(&h)
     );
     assert!(h.stop().await);
 }
 
 /// A line whose unit address itself is garbled says nothing about which unit it was: no unit is
-/// retracted for it, and the garbage never becomes a topic of its own — neither while it lasts nor
-/// once the line is clean again.
+/// taken for one that lost its power for it, and the garbage never becomes a topic of its own —
+/// neither while it lasts nor once the line is clean again.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_garbled_unit_address_retracts_nothing() {
+async fn a_garbled_unit_address_changes_no_unit() {
     let h = Harness::start_with("garble", quick(Some(Duration::from_millis(200)))).await;
     assert!(h.connected().await);
     let topic = h.topics.state("L1.002");
     h.coolmaster.set_line("L1.002", Some("L1.0\u{1}2 ON 24.0C ??? Low Heat OK # 1"));
     h.settle(Duration::from_millis(1000)).await;
     assert!(
-        h.broker.retained_on(&topic).is_some_and(|p| !p.is_empty()),
-        "a unit was retracted because its address was listed garbled: {:?}",
+        h.state("L1.002").is_some_and(|s| s["powered"] == true),
+        "a unit was taken for unpowered because its address was listed garbled: {:?}",
         h.broker.received_on(&topic).last()
     );
     h.coolmaster.set_line("L1.002", None);
@@ -342,22 +377,23 @@ async fn a_garbled_unit_address_retracts_nothing() {
 }
 
 /// A listing that says nothing usable about the units — empty (a CoolMaster rebooting, or still
-/// scanning its line), or with no line that can be read — retracts no unit, however long it lasts.
+/// scanning its line), or with no line that can be read — takes no unit for one that lost its
+/// power, however long it lasts.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_empty_or_unusable_listing_retracts_nothing() {
+async fn an_empty_or_unusable_listing_changes_no_unit() {
     let h = Harness::start_with("emptylist", quick(Some(Duration::from_millis(200)))).await;
     assert!(h.connected().await);
-    let retained = |h: &Harness| ["L1.001", "L1.002"].map(|u| h.broker.retained_on(&h.topics.state(u)).is_some_and(|p| !p.is_empty()));
+    let powered = |h: &Harness| ["L1.001", "L1.002"].map(|u| h.state(u).is_some_and(|s| s["powered"] == true));
     let a = h.coolmaster.remove_unit("L1.001").unwrap();
     let b = h.coolmaster.remove_unit("L1.002").unwrap();
     h.settle(Duration::from_millis(1000)).await;
-    assert_eq!(retained(&h), [true, true], "an empty listing retracted units");
+    assert_eq!(powered(&h), [true, true], "an empty listing took units for unpowered");
     h.coolmaster.add_unit("L1.001", a);
     h.coolmaster.add_unit("L1.002", b);
     h.coolmaster.set_line("L1.001", Some("garbage"));
     h.coolmaster.set_line("L1.002", Some("more garbage"));
     h.settle(Duration::from_millis(1000)).await;
-    assert_eq!(retained(&h), [true, true], "a listing with no usable line retracted units");
+    assert_eq!(powered(&h), [true, true], "a listing with no usable line took units for unpowered");
     assert!(h.stop().await);
 }
 

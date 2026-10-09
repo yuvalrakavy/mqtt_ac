@@ -53,7 +53,8 @@ fn a_reply_that_cannot_be_read_is_unusable() {
     }
 }
 
-/// A unit's `ls2` line becomes its State document, with v1's field names and value strings.
+/// A unit's `ls2` line becomes its State document, with v1's field names and value strings, and
+/// `"powered": true` — a unit the CoolMaster lists has power.
 #[test]
 fn an_ls2_line_is_a_state_document() {
     let state = parse_line("L4.001 OFF 19.0C 23.5C Med Heat OK   - 0").unwrap();
@@ -63,8 +64,9 @@ fn an_ls2_line_is_a_state_document() {
         json!({
             "unit": "L4.001", "power": false, "target_temperature": 19.0, "temperature": 23.5,
             "fan_speed": "Medium", "operation_mode": "Heat", "failure_code": null,
-            "filter_change": false, "demand": false
-        })
+            "filter_change": false, "demand": false, "powered": true
+        }),
+        "a listed unit's State document is not v1's fields and `powered: true`"
     );
     let state = parse_line("L7.400 ON 77F 72.5F VLow Fan 12 # 1").unwrap();
     assert_eq!(state.values["target_temperature"], json!(25.0));

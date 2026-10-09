@@ -20,9 +20,10 @@ use mqtt_bridge_kit::{
     CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkContext, LinkError, LinkHandle, OpError,
     PropertyFailure, PropertyMap, Reporter, Scope, TargetState, Timing, Value, Writes,
 };
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::protocol;
 
@@ -102,16 +103,18 @@ pub struct Coolmaster {
 /// A unit the full listings have named.
 #[derive(Debug, Default)]
 struct Known {
-    /// Its State was reported (a line of it parsed), so there is a State to retract.
+    /// Its State was reported (a line of it parsed), so there is a State to say it lost power in.
     reported: bool,
     /// Usable full listings in a row that have omitted it.
     missed: u32,
+    /// Since when it has had no power (the listings omit it), during a power-loss episode.
+    lost_since: Option<Instant>,
 }
 
-/// Usable full listings in a row that must omit a unit before it is taken for gone: one listing
-/// can be cut short or come mid-scan; two in a row (8 s at the default poll) say it left. With
-/// polling off (`--poll off`), full listings come only at a connect or a `refresh`, so it is two of
-/// those.
+/// Usable full listings in a row that must omit a unit before it is taken for one that lost its
+/// power: one listing can be cut short or come mid-scan; two in a row (8 s at the default poll)
+/// say it left. With polling off (`--poll off`), full listings come only at a connect or a
+/// `refresh`, so it is two of those.
 pub const GONE_AFTER: u32 = 2;
 
 /// The most a prompt or a reply may be, in bytes, before its `>`: far past any CoolMaster's (a
@@ -144,20 +147,22 @@ impl Coolmaster {
         self.handle.as_ref().map(LinkHandle::report)
     }
 
-    /// A full listing: the units now gone from the CoolMaster (unbound, or the controller set up
-    /// again), whose retained State is to be retracted. A unit is gone once [`GONE_AFTER`] usable
-    /// full listings in a row omit it, and only a unit whose State was reported is retracted (one
-    /// known only from a garbled line is just forgotten). A unit listed garbled under its own
-    /// address is still there. Every unit a listing names is there, whatever else the listing
-    /// says; but a listing that cannot say who is missing counts no omission: an empty one (a
-    /// CoolMaster rebooting, or still scanning its line), one with no usable line, and one with a
-    /// line whose address itself is garbled (which unit it was, nobody can tell).
+    /// A full listing: the units that have just lost their power — a unit the CoolMaster stops
+    /// listing is one whose power went (owner, 2026-10-09), never a unit to retract: its State is
+    /// kept, marked `"powered": false`, until it is listed again ([`Coolmaster::restored`]). A unit
+    /// is lost once [`GONE_AFTER`] usable full listings in a row omit it, once per episode, and only
+    /// a unit whose State was reported (one known only from a garbled line is just forgotten). A
+    /// unit listed garbled under its own address is still there. Every unit a listing names is
+    /// there, whatever else the listing says; but a listing that cannot say who is missing counts
+    /// no omission: an empty one (a CoolMaster rebooting, or still scanning its line), one with no
+    /// usable line, and one with a line whose address itself is garbled (which unit it was, nobody
+    /// can tell).
     ///
     /// What it cannot tell: a garble that still reads as an address (`L7.4O1` for `L7.401`) is a
     /// unit address like any other — listed twice in a row in place of the real one, it is
-    /// published as a unit of its own and the real one is retracted, until the garble ends. With
-    /// polling off, full listings come only at a connect or a `refresh`, so "two in a row" is two
-    /// of those.
+    /// published as a unit of its own and the real one taken for unpowered, until the garble ends.
+    /// With polling off, full listings come only at a connect or a `refresh`, so "two in a row" is
+    /// two of those.
     fn gone(&mut self, listing: &protocol::Listing) -> Vec<String> {
         let valid_bad = listing.bad.iter().filter(|b| protocol::valid_unit(&b.unit));
         let present: BTreeSet<&str> = listing.states.iter().map(|s| s.target.as_str()).chain(valid_bad.map(|b| b.unit.as_str())).collect();
@@ -172,24 +177,41 @@ impl Coolmaster {
             return Vec::new();
         }
         let mut gone = Vec::new();
+        let now = Instant::now();
         self.known.retain(|unit, known| {
             if present.contains(unit.as_str()) {
                 return true;
             }
-            known.missed += 1;
+            known.missed = known.missed.saturating_add(1);
             if known.missed < GONE_AFTER {
                 return true;
             }
             if known.reported {
-                gone.push(unit.clone());
+                if known.lost_since.is_none() {
+                    known.lost_since = Some(now);
+                    gone.push(unit.clone());
+                }
+                return true;
             }
             false
         });
         for unit in &gone {
             self.passed_over.remove(unit);
-            self.scales.remove(unit);
         }
         gone
+    }
+
+    /// Any listing: the units that had lost their power and are listed usably again, and for how
+    /// long they were down. Their fresh State (`"powered": true`) is the listing's own.
+    fn restored(&mut self, listing: &protocol::Listing) -> Vec<(String, Duration)> {
+        listing
+            .states
+            .iter()
+            .filter_map(|state| {
+                let since = self.known.get_mut(&state.target)?.lost_since.take()?;
+                Some((state.target.clone(), since.elapsed()))
+            })
+            .collect()
     }
 
     /// Say which units a listing passed over: an INFO when a unit's line first cannot be used,
@@ -380,11 +402,21 @@ impl DeviceDriver for Coolmaster {
         let listing = protocol::parse_listing(&body);
         self.note(&listing);
         self.scales.extend(listing.scales.iter().map(|(unit, scale)| (unit.clone(), *scale)));
+        for (unit, down) in self.restored(&listing) {
+            let down_for_ms = down.as_millis() as u64;
+            info!(kind = "unit_power_restored", unit = %unit, down_for_ms, "A unit the CoolMaster had stopped listing is listed again: its power is back");
+            if let Some(report) = self.report() {
+                report.event(json!({ "kind": "unit_power_restored", "target": unit, "down_for_ms": down_for_ms }));
+            }
+        }
         if unit.is_none() {
             for unit in self.gone(&listing) {
-                info!(unit = %unit, "A unit is no longer listed by the CoolMaster; its State is retracted");
+                // Once per episode: `gone` names a unit only as its power goes.
+                warn!(kind = "unit_lost_power", unit = %unit, "The CoolMaster no longer lists a unit: it has lost its power");
                 if let Some(report) = self.report() {
-                    report.remove(&unit);
+                    // Its last values stay (the runtime merges); only `powered` changes.
+                    report.state(&unit, PropertyMap::from_iter([(protocol::POWERED.to_owned(), Value::from(false))]), false);
+                    report.event(json!({ "kind": "unit_lost_power", "target": unit }));
                 }
             }
         }
@@ -464,11 +496,12 @@ mod tests {
         }
     }
 
-    /// A unit is gone — its State to be retracted — only once two usable full listings in a row
-    /// omit it, and only if it was ever reported. One listed garbled under its own address is still
-    /// there; a line whose address is garbled, an unusable listing and an empty one change nothing.
+    /// A unit has lost its power only once two usable full listings in a row omit it, only if it
+    /// was ever reported, and once per episode; listed usably again, it is restored, once. One
+    /// listed garbled under its own address is still there; a line whose address is garbled, an
+    /// unusable listing and an empty one change nothing.
     #[test]
-    fn a_unit_is_gone_only_after_two_usable_listings_omit_it() {
+    fn a_unit_is_lost_only_after_two_usable_listings_omit_it() {
         let mut driver = Coolmaster::new(Address::parse("127.0.0.1").unwrap());
         let listing = |body: &str| protocol::parse_listing(body);
         let a = "L7.400 ON 22.0C 25.0C High Cool OK - 0";
@@ -482,36 +515,41 @@ mod tests {
         for _ in 0..3 {
             assert!(
                 driver.gone(&listing(&format!("{a}\r\nL7.4\u{1}1 OFF 22.0C 25.0C High Cool OK - 0"))).is_empty(),
-                "a garbled address retracted a unit"
+                "a garbled address took a unit for lost"
             );
-            assert!(driver.gone(&listing("garbage\r\nmore garbage")).is_empty(), "an unusable listing retracted a unit");
-            assert!(driver.gone(&listing("")).is_empty(), "an empty listing retracted a unit");
+            assert!(driver.gone(&listing("garbage\r\nmore garbage")).is_empty(), "an unusable listing took a unit for lost");
+            assert!(driver.gone(&listing("")).is_empty(), "an empty listing took a unit for lost");
         }
-        // Omitted by one usable listing: not yet; by a second in a row: gone.
-        assert!(driver.gone(&listing(a)).is_empty(), "one omission retracted a unit");
+        // Omitted by one usable listing: not yet; by a second in a row: lost.
+        assert!(driver.gone(&listing(a)).is_empty(), "one omission took a unit for lost");
         // (The unusable listing's `garbage` and `more` read as addresses, were never reported, and
-        // are forgotten here, not retracted.)
+        // are forgotten here, not taken for lost.)
         assert_eq!(
             driver.gone(&listing(a)),
             ["L7.401"],
-            "only L7.401 is gone: a unit never reported was retracted, or the gone one was not"
+            "only L7.401 is lost: a unit never reported was taken for lost, or the lost one was not"
         );
-        assert!(driver.gone(&listing(a)).is_empty(), "a unit was retracted twice");
+        assert!(driver.gone(&listing(a)).is_empty(), "a unit was taken for lost twice in one episode");
+        assert!(driver.restored(&listing(a)).is_empty(), "a unit still unlisted was restored");
+        // Listed again: restored, once.
+        let restored: Vec<String> = driver.restored(&listing(both)).into_iter().map(|(unit, _)| unit).collect();
+        assert_eq!(restored, ["L7.401"], "a unit listed again was not restored");
+        assert!(driver.restored(&listing(both)).is_empty(), "a unit was restored twice");
         // One omission, then listed again: the count starts over.
-        let started_over = "a unit listed again was retracted: its earlier omission was not forgotten";
+        let started_over = "a unit listed again was taken for lost: its earlier omission was not forgotten";
         assert!(driver.gone(&listing(both)).is_empty(), "{started_over}");
         assert!(driver.gone(&listing(a)).is_empty(), "{started_over}");
         assert!(driver.gone(&listing(both)).is_empty(), "{started_over}");
         assert!(driver.gone(&listing(a)).is_empty(), "{started_over}");
-        // Known only from a garbled line under its address, never reported: forgotten, not retracted.
+        // Known only from a garbled line under its address, never reported: forgotten, not lost.
         assert!(driver.gone(&listing(&format!("{both}\r\nL7.402 ON ??? garbled"))).is_empty());
         assert!(driver.gone(&listing(both)).is_empty());
-        assert!(driver.gone(&listing(both)).is_empty(), "a unit never reported was retracted");
+        assert!(driver.gone(&listing(both)).is_empty(), "a unit never reported was taken for lost");
         // Omitted once, then named by a listing that cannot say who is missing (a garbled address
         // beside it): it was there, so the run of omissions starts over.
         assert!(driver.gone(&listing(a)).is_empty());
         assert!(driver.gone(&listing(&format!("{both}\r\nL7.4\u{1}2 OFF 22.0C 25.0C High Cool OK - 0"))).is_empty());
-        assert!(driver.gone(&listing(a)).is_empty(), "a unit named by the listing in between was retracted");
+        assert!(driver.gone(&listing(a)).is_empty(), "a unit named by the listing in between was taken for lost");
     }
 
     /// A unit address is the target as the CoolMaster lists it — `L7.400` unchanged, never a `/`,

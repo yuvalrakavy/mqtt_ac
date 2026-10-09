@@ -52,8 +52,11 @@ shutdown, the exit status), and logging. This crate keeps only the CoolMaster:
   prompt); `apply` passes over a property that fails on its own and sends the rest, returning
   `OpError::Partial` naming only the failed ones (each property is its own CoolMaster command,
   confirmed or refused alone, nothing rolled back), and a lost link ends it; each command is read
-  back (`ls2 <unit>`) so State follows at once; a unit a full listing no longer names has its
-  retained State retracted (`Reporter::remove`).
+  back (`ls2 <unit>`) so State follows at once. **A unit the CoolMaster stops listing has lost its
+  power** (owner, 2026-10-09) and is never retracted: after `GONE_AFTER` (2) usable full listings
+  omit it, its State says `"powered": false` (last values kept), one Event `unit_lost_power`; listed
+  again, fresh State (`"powered": true` is in every listed document) and one Event
+  `unit_power_restored` with `down_for_ms`.
 - `src/main.rs` — the runtime's command line plus `--coolmaster` (a driver option, made required
   with `Bridge::require`; an address it cannot use is `Bridge::usage_error`, said by `usage_exit`).
 
@@ -82,9 +85,9 @@ Built against the runtime after its R1 re-gates (tracing-init `feat/bridge-runti
 - `tests/driver.rs` — what the driver adds: Desired to commands (order, read-back), ResetFilter,
   a partly rejected write (Error for the refused property only), unusable replies, a lost link (its
   connect attempts paced), a closed connection, a command stalled mid-exchange, an over-long reply,
-  a bad `ls2` line, a unit in failure, a unit leaving the listing (and a garbled address, an empty
-  or unusable listing retracting nothing), the read-back stalled or dead, a °F unit, and the
-  Store's own request shape.
+  a bad `ls2` line, a unit in failure, a unit losing its power and getting it back (and a garbled
+  address, an empty or unusable listing changing no unit), the read-back stalled or dead, a °F
+  unit, and the Store's own request shape.
 - `tests/process.rs` — the binary: SIGTERM, `--coolmaster` usage errors, and `main` handing the
   driver `--operation-timeout` (a stalled read-back with a 1 s bound stays within it).
 - **Never** the live broker (`localhost:1883` on the Mac is the house), the LAN, or a real
@@ -102,18 +105,16 @@ device outage episodes (`connection_lost`, `external_failure`, `external_recover
 `device_connection_lost`, `device_unreachable`, `device_recovered`), `command_refused`,
 `command_rejected` (WARN: the CoolMaster refused a command — fix the unit id or the value),
 `validation_rejected`, `worker_died`, `shutdown_timeout`, and the rest of its own. The driver adds
-only an INFO when a unit's `ls2` line first cannot be used (DEBUG while it stays so, INFO when it is
-usable again) and an INFO when a unit leaves the listing (its State retracted). The log file is `logs/mqtt_ac.*` (the
+an INFO when a unit's `ls2` line first cannot be used (DEBUG while it stays so, INFO when it is
+usable again), one WARN `unit_lost_power` per power-loss episode, and an INFO
+`unit_power_restored` (`down_for_ms`) when it ends. The log file is `logs/mqtt_ac.*` (the
 runtime's file prefix is the application name); `logging.toml` adds GELF and OpenTelemetry.
 
 ## Not done (deliberately, for later)
 
-- **A unit unbound while the bridge was stopped keeps its retained State**: the first listing has
-  nothing to compare with. Retracting it needs the runtime to hand drivers the targets it read back
-  at start-up (a runtime follow-up).
 - **A garble that still reads as an address** (`L7.4O1` for `L7.401`) cannot be told from a real
   unit (re-gate R2, accepted): listed twice in a row in place of the real one, it is published as a
-  unit and the real one retracted, until the garble ends.
+  unit and the real one taken for unpowered, until the garble ends.
 
 **Temperatures:** State is in °C. A unit the CoolMaster lists in °F is converted, and a setpoint
 (asked in °C, 0–50) is sent to it in °F (`Scale`, from its last usable line). For a unit whose
