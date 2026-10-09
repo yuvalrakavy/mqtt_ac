@@ -324,9 +324,9 @@ guard       = "read_back_link_lost"
 [[control]]
 name        = "a_lost_unit_is_retracted"
 file        = "src/driver.rs"
-anchor      = '''                    report.event(json!({ "kind": "unit_lost_power", "target": unit }));'''
-replacement = '''                    report.event(json!({ "kind": "unit_lost_power", "target": unit }));
-                    report.remove(&unit);'''
+anchor      = '''                report.event(json!({ "kind": "unit_lost_power", "target": unit }));'''
+replacement = '''                report.event(json!({ "kind": "unit_lost_power", "target": unit }));
+                report.remove(unit);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_that_loses_power_is_reported_unpowered_and_restored", "--exact"]
 expect_text = '''a unit that lost power was'''
@@ -336,7 +336,7 @@ guard       = "lost_unit_never_retracted"
 [[control]]
 name        = "a_lost_unit_is_not_marked"
 file        = "src/driver.rs"
-anchor      = '''                    report.state(&unit, PropertyMap::from_iter([(protocol::POWERED.to_owned(), Value::from(false))]), false);'''
+anchor      = '''                report.state(unit, PropertyMap::from_iter([(protocol::POWERED.to_owned(), Value::from(false))]), false);'''
 replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_that_loses_power_is_reported_unpowered_and_restored", "--exact"]
@@ -347,7 +347,7 @@ guard       = "lost_unit_unpowered"
 [[control]]
 name        = "no_lost_power_event"
 file        = "src/driver.rs"
-anchor      = '''                    report.event(json!({ "kind": "unit_lost_power", "target": unit }));'''
+anchor      = '''                report.event(json!({ "kind": "unit_lost_power", "target": unit }));'''
 replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_that_loses_power_is_reported_unpowered_and_restored", "--exact"]
@@ -369,12 +369,131 @@ guard       = "power_restored_event"
 [[control]]
 name        = "lost_every_listing"
 file        = "src/driver.rs"
-anchor      = '''                if known.lost_since.is_none() {'''
-replacement = '''                if known.lost_since.is_none() || known.missed > 0 {'''
+anchor      = '''            if known.missed < GONE_AFTER || known.lost_since.is_some() {'''
+replacement = '''            if known.missed < GONE_AFTER {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_lost_only_after_two_usable_listings_omit_it", "--exact"]
 expect_text = '''a unit was taken for lost twice in one episode'''
 guard       = "lost_once_per_episode"
+
+# An episode's end never recorded: every later listing of the unit restores it again (an Event per poll).
+[[control]]
+name        = "restored_at_every_listing"
+file        = "src/driver.rs"
+anchor      = '''            if let Some(since) = known.lost_since.take() {'''
+replacement = '''            if let Some(since) = known.lost_since {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_that_loses_power_is_reported_unpowered_and_restored", "--exact"]
+expect_text = '''not one unit_power_restored per episode'''
+guard       = "restored_once_per_episode"
+
+# An episode that never ends: the unit's return is never said, and it can never lose its power again.
+[[control]]
+name        = "an_episode_never_ends"
+file        = "src/driver.rs"
+anchor      = '''            if let Some(since) = known.lost_since.take() {'''
+replacement = '''            if let Some(since) = known.lost_since.filter(|_| false) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_that_loses_power_is_reported_unpowered_and_restored", "--exact"]
+expect_text = '''no unit_power_restored Event'''
+guard       = "episode_ends"
+
+# A unit never established (one garbled listing) taken for one that lost its power: a permanent
+# ghost with an Event and a WARN (power review F1).
+[[control]]
+name        = "a_ghost_loses_power"
+file        = "src/driver.rs"
+anchor      = '''            if known.reported && known.listed >= GONE_AFTER {'''
+replacement = '''            if known.reported {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_ghost_from_one_garbled_listing_is_retracted_quietly", "--exact"]
+expect_text = '''a ghost from one garbled listing was not retracted'''
+guard       = "ghost_not_established"
+
+# A ghost that vanishes left at the broker, its State for good.
+[[control]]
+name        = "a_ghost_is_kept"
+file        = "src/driver.rs"
+anchor      = '''                report.remove(unit);'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_ghost_from_one_garbled_listing_is_retracted_quietly", "--exact"]
+expect_text = '''a ghost from one garbled listing was not retracted'''
+guard       = "ghost_retracted"
+
+# An established unit never reported (listed only garbled under its own address) taken for lost.
+[[control]]
+name        = "an_unreported_unit_is_lost"
+file        = "src/driver.rs"
+anchor      = '''            if known.reported && known.listed >= GONE_AFTER {'''
+replacement = '''            if known.listed >= GONE_AFTER {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_lost_only_after_two_usable_listings_omit_it", "--exact"]
+expect_text = '''a unit never reported was taken for lost'''
+guard       = "lost_only_reported"
+
+# Presence counted only on full listings (power review F3): after a per-unit restore, one omission
+# is a new loss.
+[[control]]
+name        = "a_per_unit_read_counts_no_presence"
+file        = "src/driver.rs"
+anchor      = '''            known.missed = 0;
+            known.first_missed = None;'''
+replacement = '''            if full {
+                known.missed = 0;
+                known.first_missed = None;
+            }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_lost_only_after_two_usable_listings_omit_it", "--exact"]
+expect_text = '''one omission after a per-unit restore was a new loss'''
+guard       = "presence_any_listing"
+
+# A unit a listing names, its run of omissions not started over (re-gate R1).
+[[control]]
+name        = "presence_is_not_counted"
+file        = "src/driver.rs"
+anchor      = '''            known.missed = 0;
+            known.first_missed = None;'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_lost_only_after_two_usable_listings_omit_it", "--exact"]
+expect_text = '''its earlier omission was not forgotten'''
+guard       = "presence_resets_omissions"
+
+# The omissions counted on without bound for a unit with no power.
+[[control]]
+name        = "the_counts_are_not_capped"
+file        = "src/driver.rs"
+anchor      = '''            known.missed = (known.missed + 1).min(GONE_AFTER);'''
+replacement = '''            known.missed += 1;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_lost_only_after_two_usable_listings_omit_it", "--exact"]
+expect_text = '''the counts are not capped'''
+guard       = "missed_capped"
+
+# `down_for_ms` counted from the loss's detection (the second omission), not the first: it
+# understates the outage by a poll or two.
+[[control]]
+name        = "down_from_detection"
+file        = "src/driver.rs"
+anchor      = '''                known.lost_since = Some(known.first_missed.unwrap_or(now));'''
+replacement = '''                known.lost_since = Some(now);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_that_loses_power_is_reported_unpowered_and_restored", "--exact"]
+expect_text = '''is not from the first omission'''
+guard       = "down_from_first_omission"
+
+# The restored Event queued before the unit's fresh State: the Store hears of the return before
+# it sees it.
+[[control]]
+name        = "the_restored_event_goes_first"
+file        = "src/driver.rs"
+anchor      = '''                    report.state(unit, state.values.clone(), false);'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_that_loses_power_is_reported_unpowered_and_restored", "--exact"]
+expect_text = '''the restored Event went out before the unit's fresh State'''
+guard       = "restored_after_state"
 
 # A listed unit's State without `powered: true`: a unit that lost power and came back is never
 # shown powered again.
@@ -393,8 +512,8 @@ guard       = "listed_unit_powered"
 [[control]]
 name        = "a_garbled_address_says_who_is_there"
 file        = "src/driver.rs"
-anchor      = '''        if !certain || listing.states.is_empty() {'''
-replacement = '''        if listing.states.is_empty() {
+anchor      = '''        if !full || !certain || listing.states.is_empty() {'''
+replacement = '''        if !full || listing.states.is_empty() {
             let _ = certain;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_garbled_unit_address_changes_no_unit", "--exact"]
@@ -405,8 +524,8 @@ guard       = "garbled_address_no_inference"
 [[control]]
 name        = "an_empty_listing_says_no_units"
 file        = "src/driver.rs"
-anchor      = '''        if !certain || listing.states.is_empty() {'''
-replacement = '''        if !certain || (listing.states.is_empty() && !listing.bad.is_empty()) {'''
+anchor      = '''        if !full || !certain || listing.states.is_empty() {'''
+replacement = '''        if !full || !certain || (listing.states.is_empty() && !listing.bad.is_empty()) {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "an_empty_or_unusable_listing_changes_no_unit", "--exact"]
 expect_text = '''an empty listing took units for unpowered'''
@@ -416,8 +535,8 @@ guard       = "empty_listing_no_inference"
 [[control]]
 name        = "an_unusable_listing_says_who_is_there"
 file        = "src/driver.rs"
-anchor      = '''        if !certain || listing.states.is_empty() {'''
-replacement = '''        if !certain || (listing.states.is_empty() && listing.bad.is_empty()) {'''
+anchor      = '''        if !full || !certain || listing.states.is_empty() {'''
+replacement = '''        if !full || !certain || (listing.states.is_empty() && listing.bad.is_empty()) {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_lost_only_after_two_usable_listings_omit_it", "--exact"]
 expect_text = '''an unusable listing took a unit for lost'''
@@ -434,28 +553,7 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib
 expect_text = '''one omission took a unit for lost'''
 guard       = "gone_after_two_listings"
 
-# A unit never reported (known only from a garbled line) taken for lost anyway.
-[[control]]
-name        = "an_unreported_unit_is_lost"
-file        = "src/driver.rs"
-anchor      = '''            if known.reported {'''
-replacement = '''            if known.reported || known.missed > 0 {'''
-target      = "command"
-argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_lost_only_after_two_usable_listings_omit_it", "--exact"]
-expect_text = '''a unit never reported was taken for lost'''
-guard       = "lost_only_reported"
 
-# A unit a listing names, its run of omissions not started over (re-gate R1): one named only by a
-# listing that cannot say who is missing is still taken for lost at the next omission.
-[[control]]
-name        = "presence_is_not_counted"
-file        = "src/driver.rs"
-anchor      = '''            self.known.entry((*unit).to_owned()).or_default().missed = 0;'''
-replacement = '''            self.known.entry((*unit).to_owned()).or_default();'''
-target      = "command"
-argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--lib", "--", "driver::tests::a_unit_is_lost_only_after_two_usable_listings_omit_it", "--exact"]
-expect_text = '''its earlier omission was not forgotten'''
-guard       = "presence_resets_omissions"
 
 # No byte limit on a reply: a CoolMaster that floods with no prompt is buffered on until the
 # operation's deadline.

@@ -69,15 +69,27 @@ v1's field names and value strings, so the Store's driver maps them as it did:
 | `powered` | `true` in every document read from the CoolMaster; `false` once the unit has lost its power (below) |
 
 **A unit the CoolMaster stops listing has lost its power** (owner, 2026-10-09) — normal life, not a
-unit gone: its `State` is never retracted. Once two usable full listings in a row have omitted it
-(8 s at the default poll; with `--poll off`, two connects or refreshes), its State is published
-with `"powered": false`, its last known values kept; one Event `unit_lost_power` and one WARN
-`unit_lost_power` per episode. Requests to it go out as usual; the CoolMaster's refusal is an
-`Error` for that property. Listed again, its State is fresh with `"powered": true`, with one Event
-`unit_power_restored` (`down_for_ms`) and an INFO. An empty listing, one with no readable line, or
-one with a garbled unit address never takes a unit for unpowered. A unit never listed since the
-bridge started stays as its retained State says: nothing new to report. A garble that still reads
-as an address (`L7.4O1` for `L7.401`) cannot be told from a real unit.
+unit gone: its `State` is never retracted.
+- **Loss:** once two usable full listings in a row have omitted an established unit (one named by
+  at least two usable full listings; 8 s at the default poll; with `--poll off`, two connects or
+  refreshes), its State is published with `"powered": false`, its last known values kept; one
+  Event `unit_lost_power` and one WARN `unit_lost_power` per episode.
+- **Requests** to it go out as usual; the CoolMaster's refusal is an `Error` for that property.
+- **Return:** listed again (by any listing: a poll, a `refresh`, the read-back after a command),
+  its fresh State with `"powered": true` goes out first, then one Event `unit_power_restored`, with
+  `down_for_ms` counted from the first listing that omitted it, and an INFO.
+- **What changes nothing:** an empty listing, one with no readable line, or one with a garbled unit
+  address never takes a unit for unpowered. A unit seen by fewer than two usable full listings — a
+  garble that read as an address (`L1.0O2` for `L1.002`) in one listing — is a ghost: when it
+  vanishes its State is retracted quietly, with no Event and no WARN. A garble that reads as an
+  address in two listings or more cannot be told from a real unit.
+- **`powered` in State is authoritative; the Events are best-effort notifications.** An Event can
+  be lost: the runtime keeps at most 64 waiting while MQTT is out, the oldest displaced. The State
+  is retained and republished on every reconnect.
+- **A controller reboot** that lists only part of its line for two polls or more (while it scans)
+  shows as a burst of `unit_lost_power` Events and WARNs, then `unit_power_restored` ones: expected.
+- **Across a restart of the bridge:** a unit never listed since the bridge started stays as its
+  retained State says (the runtime's read-back of it is not yet handed to the driver).
 
 ### What a request can set (`Desired`)
 

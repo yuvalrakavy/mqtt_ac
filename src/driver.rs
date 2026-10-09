@@ -33,6 +33,8 @@ use crate::protocol;
 /// WARN past 30 s down, a listing every 4 s. v1 bounded each exchange at 10 s; the runtime bounds
 /// each operation, an `apply`'s few exchanges together, which a CoolMaster answers in milliseconds.
 /// Anything else `DriverInfo` holds keeps its default.
+// Every field is named today (the runtime dropped `restore`); the update keeps it so when it adds one.
+#[allow(clippy::needless_update)]
 pub fn info() -> DriverInfo {
     DriverInfo {
         writes: Writes::Acknowledged,
@@ -99,15 +101,32 @@ pub struct Coolmaster {
     scales: BTreeMap<String, protocol::Scale>,
 }
 
-/// A unit the full listings have named.
+/// A unit the listings have named.
 #[derive(Debug, Default)]
 struct Known {
     /// Its State was reported (a line of it parsed), so there is a State to say it lost power in.
     reported: bool,
-    /// Usable full listings in a row that have omitted it.
+    /// Usable full listings that have named it, up to [`GONE_AFTER`]: at `GONE_AFTER` it is
+    /// established — a unit of the CoolMaster's, which can lose its power. One named by fewer (a
+    /// garble that read as an address, in one listing) is a ghost when it vanishes.
+    listed: u32,
+    /// Usable full listings in a row that have omitted it, up to [`GONE_AFTER`].
     missed: u32,
-    /// Since when it has had no power (the listings omit it), during a power-loss episode.
+    /// When the run of omissions began (the first listing that omitted it).
+    first_missed: Option<Instant>,
+    /// Since when it has had no power — its first omission — during a power-loss episode.
     lost_since: Option<Instant>,
+}
+
+/// What a listing says about the units' power ([`Coolmaster::observe`]).
+#[derive(Debug, Default, PartialEq)]
+struct Observed {
+    /// Established units that have just lost their power.
+    lost: Vec<String>,
+    /// Units never established that are gone: ghosts, to retract quietly.
+    vanished: Vec<String>,
+    /// Units whose power is back, and how long it was gone.
+    restored: Vec<(String, Duration)>,
 }
 
 /// Usable full listings in a row that must omit a unit before it is taken for one that lost its
@@ -146,71 +165,92 @@ impl Coolmaster {
         self.handle.as_ref().map(LinkHandle::report)
     }
 
-    /// A full listing: the units that have just lost their power — a unit the CoolMaster stops
-    /// listing is one whose power went (owner, 2026-10-09), never a unit to retract: its State is
-    /// kept, marked `"powered": false`, until it is listed again ([`Coolmaster::restored`]). A unit
-    /// is lost once [`GONE_AFTER`] usable full listings in a row omit it, once per episode, and only
-    /// a unit whose State was reported (one known only from a garbled line is just forgotten). A
-    /// unit listed garbled under its own address is still there. Every unit a listing names is
-    /// there, whatever else the listing says; but a listing that cannot say who is missing counts
-    /// no omission: an empty one (a CoolMaster rebooting, or still scanning its line), one with no
-    /// usable line, and one with a line whose address itself is garbled (which unit it was, nobody
-    /// can tell).
+    /// What a listing (`full`: of every unit) says about the units' power. A unit the CoolMaster
+    /// stops listing is one whose power went (owner, 2026-10-09), never a unit to retract: its
+    /// State is kept, marked `"powered": false`, until it is listed again.
     ///
-    /// What it cannot tell: a garble that still reads as an address (`L7.4O1` for `L7.401`) is a
-    /// unit address like any other — listed twice in a row in place of the real one, it is
-    /// published as a unit of its own and the real one taken for unpowered, until the garble ends.
-    /// With polling off, full listings come only at a connect or a `refresh`, so "two in a row" is
-    /// two of those.
-    fn gone(&mut self, listing: &protocol::Listing) -> Vec<String> {
+    /// - **Presence:** every unit a listing names — a usable line, or a bad one under its own
+    ///   address — is there, whatever listing it is (a full one, `ls2 <unit>`, a read-back): its
+    ///   run of omissions starts over. A usable line of a unit that had lost its power ends the
+    ///   episode (`restored`, with how long it was down).
+    /// - **Omissions** count only on a usable full listing that can say who is missing: never an
+    ///   empty one (a CoolMaster rebooting, or still scanning its line), one with no usable line,
+    ///   or one with a line whose address itself is garbled (which unit it was, nobody can tell).
+    ///   After [`GONE_AFTER`] in a row a unit is gone: one **established** — named by at least
+    ///   `GONE_AFTER` usable full listings — has lost its power (`lost`, once per episode, from its
+    ///   first omission); one never established is a ghost (a garble that read as an address, in a
+    ///   listing or so), retracted quietly (`vanished`) if its State was reported, and one known
+    ///   only from a garbled line is just forgotten.
+    ///
+    /// What it cannot tell: a garble that reads as an address in `GONE_AFTER` listings or more is
+    /// established like any unit. With polling off, full listings come only at a connect or a
+    /// `refresh`, so "two in a row" is two of those.
+    fn observe(&mut self, listing: &protocol::Listing, full: bool) -> Observed {
+        let mut observed = Observed::default();
         let valid_bad = listing.bad.iter().filter(|b| protocol::valid_unit(&b.unit));
         let present: BTreeSet<&str> = listing.states.iter().map(|s| s.target.as_str()).chain(valid_bad.map(|b| b.unit.as_str())).collect();
-        for state in &listing.states {
-            self.known.entry(state.target.clone()).or_default().reported = true;
-        }
         for unit in &present {
-            self.known.entry((*unit).to_owned()).or_default().missed = 0;
+            let known = self.known.entry((*unit).to_owned()).or_default();
+            known.missed = 0;
+            known.first_missed = None;
+        }
+        for state in &listing.states {
+            let known = self.known.entry(state.target.clone()).or_default();
+            known.reported = true;
+            if let Some(since) = known.lost_since.take() {
+                observed.restored.push((state.target.clone(), since.elapsed()));
+            }
         }
         let certain = listing.bad.iter().all(|b| protocol::valid_unit(&b.unit));
-        if !certain || listing.states.is_empty() {
-            return Vec::new();
+        if !full || !certain || listing.states.is_empty() {
+            return observed;
         }
-        let mut gone = Vec::new();
+        for unit in &present {
+            if let Some(known) = self.known.get_mut(*unit) {
+                known.listed = (known.listed + 1).min(GONE_AFTER);
+            }
+        }
         let now = Instant::now();
         self.known.retain(|unit, known| {
             if present.contains(unit.as_str()) {
                 return true;
             }
-            known.missed = known.missed.saturating_add(1);
-            if known.missed < GONE_AFTER {
+            if known.missed == 0 {
+                known.first_missed = Some(now);
+            }
+            known.missed = (known.missed + 1).min(GONE_AFTER);
+            if known.missed < GONE_AFTER || known.lost_since.is_some() {
+                return true;
+            }
+            if known.reported && known.listed >= GONE_AFTER {
+                known.lost_since = Some(known.first_missed.unwrap_or(now));
+                observed.lost.push(unit.clone());
                 return true;
             }
             if known.reported {
-                if known.lost_since.is_none() {
-                    known.lost_since = Some(now);
-                    gone.push(unit.clone());
-                }
-                return true;
+                observed.vanished.push(unit.clone());
             }
             false
         });
-        for unit in &gone {
+        for unit in observed.lost.iter().chain(&observed.vanished) {
             self.passed_over.remove(unit);
         }
-        gone
+        for unit in &observed.vanished {
+            self.scales.remove(unit);
+        }
+        observed
     }
 
-    /// Any listing: the units that had lost their power and are listed usably again, and for how
-    /// long they were down. Their fresh State (`"powered": true`) is the listing's own.
+    /// A full listing's power losses (tests).
+    #[cfg(test)]
+    fn gone(&mut self, listing: &protocol::Listing) -> Vec<String> {
+        self.observe(listing, true).lost
+    }
+
+    /// A per-unit listing's restorations (tests).
+    #[cfg(test)]
     fn restored(&mut self, listing: &protocol::Listing) -> Vec<(String, Duration)> {
-        listing
-            .states
-            .iter()
-            .filter_map(|state| {
-                let since = self.known.get_mut(&state.target)?.lost_since.take()?;
-                Some((state.target.clone(), since.elapsed()))
-            })
-            .collect()
+        self.observe(listing, false).restored
     }
 
     /// Say which units a listing passed over: an INFO when a unit's line first cannot be used,
@@ -389,8 +429,11 @@ impl DeviceDriver for Coolmaster {
     }
 
     /// `ls2`: every unit (`Scope::All`, and `Scope::Any`), or one. A line that cannot be used costs
-    /// only its own unit; a listing with no usable line is `Unusable`. A unit a full listing no
-    /// longer names has its retained `State` retracted, so the broker keeps no ghost of it.
+    /// only its own unit; a listing with no usable line is `Unusable`. What the listing says of the
+    /// units' power ([`Coolmaster::observe`]) is reported here: a unit that lost its power keeps
+    /// its State, marked `"powered": false`, with one `unit_lost_power` Event and WARN; one whose
+    /// power is back gets its fresh State first, then one `unit_power_restored` Event and an INFO;
+    /// a ghost (never established) is retracted quietly.
     async fn read_state(&mut self, scope: Scope) -> Result<Vec<TargetState>, OpError> {
         let unit = match &scope {
             Scope::Target(unit) => Some(unit.as_str()),
@@ -401,22 +444,27 @@ impl DeviceDriver for Coolmaster {
         let listing = protocol::parse_listing(&body);
         self.note(&listing);
         self.scales.extend(listing.scales.iter().map(|(unit, scale)| (unit.clone(), *scale)));
-        for (unit, down) in self.restored(&listing) {
-            let down_for_ms = down.as_millis() as u64;
-            info!(kind = "unit_power_restored", unit = %unit, down_for_ms, "A unit the CoolMaster had stopped listing is listed again: its power is back");
-            if let Some(report) = self.report() {
+        let observed = self.observe(&listing, unit.is_none());
+        if let Some(report) = self.report() {
+            for (unit, down) in &observed.restored {
+                let down_for_ms = down.as_millis() as u64;
+                info!(kind = "unit_power_restored", unit = %unit, down_for_ms, "A unit the CoolMaster had stopped listing is listed again: its power is back");
+                // Its fresh State (`powered: true`) goes first, then the Event.
+                if let Some(state) = listing.states.iter().find(|s| &s.target == unit) {
+                    report.state(unit, state.values.clone(), false);
+                }
                 report.event(json!({ "kind": "unit_power_restored", "target": unit, "down_for_ms": down_for_ms }));
             }
-        }
-        if unit.is_none() {
-            for unit in self.gone(&listing) {
-                // Once per episode: `gone` names a unit only as its power goes.
+            for unit in &observed.lost {
+                // Once per episode: `observe` names a unit only as its power goes.
                 warn!(kind = "unit_lost_power", unit = %unit, "The CoolMaster no longer lists a unit: it has lost its power");
-                if let Some(report) = self.report() {
-                    // Its last values stay (the runtime merges); only `powered` changes.
-                    report.state(&unit, PropertyMap::from_iter([(protocol::POWERED.to_owned(), Value::from(false))]), false);
-                    report.event(json!({ "kind": "unit_lost_power", "target": unit }));
-                }
+                // Its last values stay (the runtime merges); only `powered` changes.
+                report.state(unit, PropertyMap::from_iter([(protocol::POWERED.to_owned(), Value::from(false))]), false);
+                report.event(json!({ "kind": "unit_lost_power", "target": unit }));
+            }
+            for unit in &observed.vanished {
+                debug!(unit = %unit, "A unit never established is no longer listed: a ghost, retracted");
+                report.remove(unit);
             }
         }
         listing.into_states()
@@ -549,6 +597,34 @@ mod tests {
         assert!(driver.gone(&listing(a)).is_empty());
         assert!(driver.gone(&listing(&format!("{both}\r\nL7.4\u{1}2 OFF 22.0C 25.0C High Cool OK - 0"))).is_empty());
         assert!(driver.gone(&listing(a)).is_empty(), "a unit named by the listing in between was taken for lost");
+        // Lost, then seen again only by a per-unit read (`ls2 L7.401`, a read-back): restored, and
+        // its omissions start over — one full listing omitting it is not a new loss.
+        assert_eq!(driver.gone(&listing(a)), ["L7.401"]);
+        let per_unit = listing("L7.401 OFF 22.0C 25.0C High Cool OK - 0");
+        assert_eq!(driver.restored(&per_unit).len(), 1, "a per-unit read did not restore the unit");
+        assert!(driver.gone(&listing(a)).is_empty(), "one omission after a per-unit restore was a new loss");
+        // A ghost: a garble that read as an address, in one listing. Never established, so when it
+        // vanishes it is retracted quietly — never a unit that lost its power.
+        let ghost = format!("{both}\r\nL7.4O1 ON 22.0C 25.0C High Cool OK - 0");
+        assert!(driver.observe(&listing(&ghost), true).lost.is_empty());
+        assert!(driver.observe(&listing(both), true).vanished.is_empty(), "a ghost vanished after one omission");
+        let observed = driver.observe(&listing(both), true);
+        assert!(observed.lost.is_empty(), "a ghost from one garbled listing was taken for a unit that lost its power");
+        assert_eq!(observed.vanished, ["L7.4O1"], "a ghost was not retracted");
+        assert!(!driver.known.contains_key("L7.4O1"), "a ghost stayed known");
+        // Established but never reported (listed only garbled under its own address): forgotten.
+        let garbled = format!("{both}\r\nL7.403 ON ??? garbled");
+        driver.observe(&listing(&garbled), true);
+        driver.observe(&listing(&garbled), true);
+        driver.observe(&listing(both), true);
+        assert!(driver.observe(&listing(both), true).lost.is_empty(), "a unit never reported was taken for lost");
+        assert!(!driver.known.contains_key("L7.403"));
+        // The counts stay within GONE_AFTER, however long a unit is omitted or listed.
+        for _ in 0..5 {
+            driver.observe(&listing(a), true);
+        }
+        let known = &driver.known["L7.401"];
+        assert_eq!((known.missed, known.listed), (GONE_AFTER, GONE_AFTER), "the counts are not capped");
     }
 
     /// A unit address is the target as the CoolMaster lists it — `L7.400` unchanged, never a `/`,

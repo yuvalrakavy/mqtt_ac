@@ -8,6 +8,7 @@
 #![allow(dead_code, unused_imports)] // each test binary uses its own part of the harness
 
 pub mod coolmaster;
+pub mod log;
 
 use std::time::{Duration, Instant};
 
@@ -88,6 +89,7 @@ impl Harness {
 
     /// The same, after `prepare` has set the CoolMaster up for the bridge's first connection.
     pub async fn start_prepared(instance: &str, timing: TimingOverrides, prepare: impl FnOnce(&FakeCoolmaster)) -> Harness {
+        log::install();
         let broker = FakeBroker::start().await;
         broker.cap_connections(50);
         let coolmaster = FakeCoolmaster::start().await;

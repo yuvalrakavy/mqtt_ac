@@ -305,13 +305,17 @@ fn events(h: &Harness) -> Vec<serde_json::Value> {
 async fn a_unit_that_loses_power_is_reported_unpowered_and_restored() {
     let h = Harness::start_with("powerloss", quick(Some(Duration::from_millis(200)))).await;
     assert!(h.connected().await);
+    // Established: named by two full listings or more before it goes.
+    h.settle(Duration::from_millis(500)).await;
     let unit = h.coolmaster.remove_unit("L1.002").expect("the stand-in's L1.002");
+    let removed_at = std::time::Instant::now();
     assert!(
         h.eventually(BOUND, |h| h.state("L1.002").is_some_and(|s| s["powered"] == false)).await,
         "a unit that lost power was not reported unpowered: {:?}; retained: {:?}",
         h.broker.received_on(&h.topics.state("L1.002")).last(),
         h.broker.retained_on(&h.topics.state("L1.002"))
     );
+    let detected_at = std::time::Instant::now();
     let state = h.state("L1.002").unwrap();
     assert_eq!(
         (state["operation_mode"].as_str(), state["target_temperature"].as_f64()),
@@ -342,14 +346,78 @@ async fn a_unit_that_loses_power_is_reported_unpowered_and_restored() {
         "a unit whose power came back was not reported powered: {:?}",
         h.state("L1.002")
     );
+    let restored = |h: &Harness| events(h).into_iter().filter(|e| e["kind"] == "unit_power_restored").collect::<Vec<_>>();
+    assert!(h.eventually(BOUND, |h| !restored(h).is_empty()).await, "no unit_power_restored Event: {:?}", events(&h));
+    let was_down = removed_at.elapsed();
+    let since_detected = detected_at.elapsed();
+    h.settle(Duration::from_millis(600)).await;
+    let first = restored(&h);
+    assert_eq!(first.len(), 1, "not one unit_power_restored per episode: {first:?}");
+    assert_eq!(first[0]["target"], "L1.002");
+    // From the first omission — a poll (200 ms) before the loss was seen — never past the outage.
+    let down = first[0]["down_for_ms"].as_u64().expect("down_for_ms");
     assert!(
-        h.eventually(BOUND, |h| events(h)
-            .iter()
-            .any(|e| e["kind"] == "unit_power_restored" && e["target"] == "L1.002" && e["down_for_ms"].is_u64()))
-            .await,
-        "no unit_power_restored Event: {:?}",
-        events(&h)
+        down >= since_detected.as_millis() as u64 + 100 && down <= was_down.as_millis() as u64 + 50,
+        "down_for_ms {down} is not from the first omission: the loss was seen {since_detected:?}, the unit removed {was_down:?}, before its return"
     );
+    // The fresh State with `powered: true` reached the broker before the Event.
+    let received = h.broker.received();
+    let restored_at =
+        received.iter().position(|r| r.topic == h.topics.event() && r.payload.windows(19).any(|w| w == b"unit_power_restored"));
+    let fresh_after_loss = received
+        .iter()
+        .enumerate()
+        .skip_while(|(_, r)| !(r.topic == h.topics.event() && r.payload.windows(15).any(|w| w == b"unit_lost_power")))
+        .find(|(_, r)| {
+            r.topic == h.topics.state("L1.002")
+                && serde_json::from_slice::<serde_json::Value>(&r.payload).is_ok_and(|s| s["powered"] == true)
+        })
+        .map(|(i, _)| i);
+    assert!(
+        fresh_after_loss.zip(restored_at).is_some_and(|(state, event)| state < event),
+        "the restored Event went out before the unit's fresh State: State at {fresh_after_loss:?}, Event at {restored_at:?}"
+    );
+    // The log: one WARN for the loss, one INFO for the return.
+    let warns = log::logged("unit_lost_power", "L1.002");
+    let infos = log::logged("unit_power_restored", "L1.002");
+    assert!(warns.len() == 1 && warns[0].level == tracing::Level::WARN, "the loss was not one WARN: {warns:?}");
+    assert!(infos.len() == 1 && infos[0].level == tracing::Level::INFO, "the return was not one INFO: {infos:?}");
+    // A second episode: lost again, restored again — one Event each.
+    let unit = h.coolmaster.remove_unit("L1.002").expect("L1.002 again");
+    assert!(
+        h.eventually(BOUND, |h| h.state("L1.002").is_some_and(|s| s["powered"] == false)).await,
+        "a second power loss was not reported: {:?}",
+        h.state("L1.002")
+    );
+    h.coolmaster.add_unit("L1.002", unit);
+    assert!(h.eventually(BOUND, |h| restored(h).len() == 2).await, "the second episode never ended: {:?}", events(&h));
+    h.settle(Duration::from_millis(600)).await;
+    let kinds: Vec<String> = events(&h).iter().filter_map(|e| e["kind"].as_str().map(str::to_owned)).collect();
+    assert_eq!(kinds, ["unit_lost_power", "unit_power_restored", "unit_lost_power", "unit_power_restored"], "the two episodes' Events");
+    assert!(h.stop().await);
+}
+
+/// A garble that reads as an address (`L1.0O2` for `L1.002`) in one listing makes a unit nobody
+/// has: when it vanishes it was never established (fewer than GONE_AFTER listings named it), so it
+/// is retracted quietly — never a unit that "lost its power", with no Event and no WARN — and the
+/// real unit is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ghost_from_one_garbled_listing_is_retracted_quietly() {
+    let h = Harness::start_with("ghost", quick(Some(Duration::from_millis(200)))).await;
+    assert!(h.connected().await);
+    h.coolmaster.garble_next_listing("L1.002", "L1.0O2 ON 24.0C 21.5C Low Heat OK # 1");
+    let ghost = h.topics.state("L1.0O2");
+    assert!(h.eventually(BOUND, |h| !h.broker.received_on(&ghost).is_empty()).await, "the garbled listing was never read");
+    assert!(
+        h.eventually(BOUND, |h| h.broker.received_on(&ghost).last().is_some_and(|r| r.payload.is_empty() && r.retain)).await,
+        "a ghost from one garbled listing was not retracted: {:?}",
+        h.broker.received_on(&ghost).last()
+    );
+    h.settle(Duration::from_millis(600)).await;
+    assert!(h.broker.retained_on(&ghost).is_none());
+    assert!(events(&h).is_empty(), "a ghost made Events: {:?}", events(&h));
+    assert!(log::logged("unit_lost_power", "L1.0O2").is_empty(), "a ghost was logged as a unit that lost its power");
+    assert!(h.state("L1.002").is_some_and(|s| s["powered"] == true), "the real unit changed: {:?}", h.state("L1.002"));
     assert!(h.stop().await);
 }
 

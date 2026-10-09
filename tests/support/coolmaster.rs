@@ -122,6 +122,8 @@ struct Shared {
     units: Mutex<BTreeMap<String, Unit>>,
     /// Units whose listing line is this, verbatim, in place of their state.
     lines: Mutex<BTreeMap<String, String>>,
+    /// Units whose line in the next full listing only is this, verbatim.
+    once: Mutex<BTreeMap<String, String>>,
     /// Commands answered otherwise, by the prefix they start with; the first match wins. A rule
     /// with a count answers that many commands, and is then gone.
     answers: Mutex<Vec<Rule>>,
@@ -157,6 +159,7 @@ impl FakeCoolmaster {
             up: AtomicBool::new(true),
             units: Mutex::new(units()),
             lines: Mutex::new(BTreeMap::new()),
+            once: Mutex::new(BTreeMap::new()),
             answers: Mutex::new(Vec::new()),
             gate: tokio::sync::Semaphore::new(0),
             served: AtomicUsize::new(0),
@@ -221,6 +224,16 @@ impl FakeCoolmaster {
     /// Change a unit at the CoolMaster, as a person at the wall does.
     pub fn change(&self, unit: &str, change: impl FnOnce(&mut Unit)) {
         change(self.shared.units.lock().unwrap().get_mut(unit).expect("a unit of the stand-in"));
+    }
+
+    /// List `unit` as `line`, verbatim, in the next full listing only (a one-poll garble).
+    pub fn garble_next_listing(&self, unit: &str, line: &str) {
+        self.shared.once.lock().unwrap().insert(unit.to_owned(), line.to_owned());
+    }
+
+    /// Whether a one-poll garble is still waiting for its listing.
+    pub fn garble_pending(&self) -> bool {
+        !self.shared.once.lock().unwrap().is_empty()
     }
 
     /// List `unit` as `line`, verbatim, in place of its state; `None` lists its state again.
@@ -295,10 +308,14 @@ fn reply(shared: &Shared, command: &str) -> String {
             if wanted.is_some_and(|u| !units.contains_key(u)) {
                 return "ERROR: 3\r\n".to_owned();
             }
+            let mut once = shared.once.lock().unwrap();
             let listing: Vec<String> = units
                 .iter()
                 .filter(|(u, _)| wanted.is_none_or(|w| w == u.as_str()))
-                .map(|(u, unit)| lines.get(u).cloned().unwrap_or_else(|| unit.line(u)))
+                .map(|(u, unit)| {
+                    let garbled = if wanted.is_none() { once.remove(u) } else { None };
+                    garbled.or_else(|| lines.get(u).cloned()).unwrap_or_else(|| unit.line(u))
+                })
                 .collect();
             ok(listing.join("\r\n"))
         }

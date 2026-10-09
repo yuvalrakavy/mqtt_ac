@@ -28,6 +28,8 @@ mqtt-test-broker = { path = "/Users/yuval/Documents/Projects/tracing-init-br/mqt
 # TODO: pin to the tracing-init git rev once R1 merges
 wait-lint = { path = "/Users/yuval/Documents/Projects/tracing-init-br/wait-lint" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+# The driver tests' log capture (tests/support/log.rs).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
 # to run with logging use
 #  RUST_LOG=trace,rumqttc=off mqtt_ac ...

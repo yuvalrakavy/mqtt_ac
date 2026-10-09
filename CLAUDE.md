@@ -53,10 +53,15 @@ shutdown, the exit status), and logging. This crate keeps only the CoolMaster:
   `OpError::Partial` naming only the failed ones (each property is its own CoolMaster command,
   confirmed or refused alone, nothing rolled back), and a lost link ends it; each command is read
   back (`ls2 <unit>`) so State follows at once. **A unit the CoolMaster stops listing has lost its
-  power** (owner, 2026-10-09) and is never retracted: after `GONE_AFTER` (2) usable full listings
-  omit it, its State says `"powered": false` (last values kept), one Event `unit_lost_power`; listed
-  again, fresh State (`"powered": true` is in every listed document) and one Event
-  `unit_power_restored` with `down_for_ms`.
+  power** (owner, 2026-10-09) and is never retracted (`observe`): after `GONE_AFTER` (2) usable
+  full listings omit an *established* unit (named by at least `GONE_AFTER` usable full listings),
+  its State says `"powered": false` (last values kept), one Event `unit_lost_power`, one WARN;
+  listed again by any listing, its fresh State (`"powered": true` is in every listed document)
+  then one Event `unit_power_restored` (`down_for_ms` from the first omission) and an INFO. A unit
+  never established that vanishes is a ghost, retracted quietly. Every usable observation of a
+  unit starts its omissions over; omissions count only on usable full listings; both counts are
+  capped at `GONE_AFTER`. `powered` is authoritative; the Events are best-effort (the runtime's
+  64-entry Event queue can displace them during an MQTT outage).
 - `src/main.rs` — the runtime's command line plus `--coolmaster` (a driver option, made required
   with `Bridge::require`; an address it cannot use is `Bridge::usage_error`, said by `usage_exit`).
 
@@ -115,6 +120,11 @@ runtime's file prefix is the application name); `logging.toml` adds GELF and Ope
 - **A garble that still reads as an address** (`L7.4O1` for `L7.401`) cannot be told from a real
   unit (re-gate R2, accepted): listed twice in a row in place of the real one, it is published as a
   unit and the real one taken for unpowered, until the garble ends.
+- **Power across a bridge restart** waits for the runtime's read-back accessor (`ctx.read_back()`,
+  coming): then `known` is seeded from the retained State — `powered:false` targets start in an
+  open episode (`since_restart: true`), `powered:true` ones count as established, so a unit that
+  lost power while the bridge was down is reported lost. Until then a unit never listed since the
+  start stays as its retained State says.
 
 **Temperatures:** State is in °C. A unit the CoolMaster lists in °F is converted, and a setpoint
 (asked in °C, 0–50) is sent to it in °F (`Scale`, from its last usable line). For a unit whose
