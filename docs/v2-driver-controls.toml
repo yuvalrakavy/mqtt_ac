@@ -615,3 +615,85 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "wait_registry"]
 expect_text = '''is an untagged wait'''
 guard       = "registry_wired"
+
+# --- Restart seeding (the runtime's read-back of the previous run's retained State) ---
+# Test binary: tests/restart.rs.
+
+# The retained State never seeds the driver: a unit retained unpowered is not restored.
+[[control]]
+name        = "the_read_back_is_never_seeded"
+file        = "src/driver.rs"
+anchor      = '''        let Some(back) = self.handle.as_ref().map(LinkHandle::read_back).filter(|back| back.complete) else {'''
+replacement = '''        let Some(back) = self.handle.as_ref().map(LinkHandle::read_back).filter(|back| back.complete && back.targets.is_empty()) else {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "restart", "--", "a_unit_retained_unpowered_is_restored_when_it_is_listed_after_a_restart", "--exact"]
+expect_text = '''no unit_power_restored Event for a unit retained unpowered'''
+guard       = "read_back_seeds"
+
+# Seeded at the first listing whatever the read-back says: an incomplete one seeds nothing, once and for all.
+[[control]]
+name        = "an_incomplete_read_back_is_seeded_for_good"
+file        = "src/driver.rs"
+anchor      = '''        let Some(back) = self.handle.as_ref().map(LinkHandle::read_back).filter(|back| back.complete) else {'''
+replacement = '''        let Some(back) = self.handle.as_ref().map(LinkHandle::read_back).filter(|_| true) else {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "restart", "--", "an_incomplete_read_back_is_seeded_at_the_poll_that_finds_it_complete", "--exact"]
+expect_text = '''was never seeded'''
+guard       = "seed_waits_for_complete"
+
+# A unit retained unpowered given no open episode: its loss is reported again, and it is never
+# restored since the restart.
+[[control]]
+name        = "a_retained_unpowered_unit_opens_no_episode"
+file        = "src/driver.rs"
+anchor      = '''                    let lost_since = (!powered).then_some(self.started);'''
+replacement = '''                    let lost_since: Option<Instant> = None;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "restart", "--", "a_unit_retained_unpowered_is_restored_when_it_is_listed_after_a_restart", "--exact"]
+expect_text = '''was reported'''
+guard       = "unpowered_opens_episode"
+
+# A unit retained powered not established: the listings omitting it make a ghost, not a loss.
+[[control]]
+name        = "a_retained_powered_unit_is_not_established"
+file        = "src/driver.rs"
+anchor      = '''listed: GONE_AFTER, missed, lost_since,'''
+replacement = '''listed: 0, missed, lost_since,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "restart", "--", "a_unit_retained_powered_that_the_coolmaster_omits_is_reported_lost", "--exact"]
+expect_text = '''was not reported unpowered'''
+guard       = "powered_is_established"
+
+# A unit retained powered given an open episode: listed, it is restored on the previous run's
+# report alone, which is not evidence from the device.
+[[control]]
+name        = "a_retained_powered_unit_opens_an_episode"
+file        = "src/driver.rs"
+anchor      = '''                    let lost_since = (!powered).then_some(self.started);'''
+replacement = '''                    let lost_since = Some(self.started);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "restart", "--", "units_retained_powered_and_listed_say_nothing_after_a_restart", "--exact"]
+expect_text = '''produced Events'''
+guard       = "retained_is_not_evidence"
+
+# The restore of an episode the previous run left open not marked as counted from the restart.
+[[control]]
+name        = "the_restore_is_not_marked_since_restart"
+file        = "src/driver.rs"
+anchor      = '''                if *since_restart {'''
+replacement = '''                if false && *since_restart {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "restart", "--", "a_unit_retained_unpowered_is_restored_when_it_is_listed_after_a_restart", "--exact"]
+expect_text = '''was not counted from the restart'''
+guard       = "since_restart_marked"
+
+# Seeded at every listing, not once: a unit seeded as restored is restored again.
+[[control]]
+name        = "the_seed_is_made_at_every_listing"
+file        = "src/driver.rs"
+anchor      = '''        self.seeded = true;'''
+replacement = '''        self.seeded = false;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "restart", "--", "a_unit_retained_unpowered_is_restored_when_it_is_listed_after_a_restart", "--exact"]
+expect_text = '''not one unit_power_restored'''
+guard       = "seeded_once"
