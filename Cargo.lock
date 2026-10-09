@@ -559,6 +559,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "lock-order"
 version = "0.1.0"
+source = "git+https://github.com/yuvalrakavy/tracing-init.git?rev=fede5907474239c3041e38dded2750994713fdcc#fede5907474239c3041e38dded2750994713fdcc"
 dependencies = [
  "libc",
  "tokio",
@@ -619,6 +620,7 @@ dependencies = [
 [[package]]
 name = "mqtt-bridge-kit"
 version = "0.1.0"
+source = "git+https://github.com/yuvalrakavy/tracing-init.git?rev=fede5907474239c3041e38dded2750994713fdcc#fede5907474239c3041e38dded2750994713fdcc"
 dependencies = [
  "bytes",
  "lock-order",
@@ -632,6 +634,7 @@ dependencies = [
 [[package]]
 name = "mqtt-test-broker"
 version = "0.1.0"
+source = "git+https://github.com/yuvalrakavy/tracing-init.git?rev=fede5907474239c3041e38dded2750994713fdcc#fede5907474239c3041e38dded2750994713fdcc"
 dependencies = [
  "bytes",
  "rumqttc",
@@ -1509,6 +1512,7 @@ dependencies = [
 [[package]]
 name = "tracing-init"
 version = "0.2.0"
+source = "git+https://github.com/yuvalrakavy/tracing-init.git?rev=fede5907474239c3041e38dded2750994713fdcc#fede5907474239c3041e38dded2750994713fdcc"
 dependencies = [
  "bitflags",
  "futures-util",
@@ -1632,6 +1636,7 @@ checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
 [[package]]
 name = "wait-lint"
 version = "0.1.0"
+source = "git+https://github.com/yuvalrakavy/tracing-init.git?rev=fede5907474239c3041e38dded2750994713fdcc#fede5907474239c3041e38dded2750994713fdcc"
 dependencies = [
  "proc-macro2",
  "syn",

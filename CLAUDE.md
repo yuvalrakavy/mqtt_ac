@@ -31,8 +31,8 @@ cargo fmt                                                # rustfmt.toml: wide, l
 ./install_to_pi <pi_ip> <mqtt_broker> <controller_name> <coolmaster_ip>
 ```
 
-The runtime, `mqtt-test-broker` and `wait-lint` are path dependencies on a tracing-init checkout
-for now (`Cargo.toml`, `TODO: pin to the tracing-init git rev once R1 merges`).
+The runtime, `mqtt-test-broker` and `wait-lint` are git dependencies on tracing-init, pinned to one
+`rev` (fede590, `Cargo.toml`).
 
 ## Architecture
 
@@ -83,7 +83,7 @@ that is not text or is empty, and a listing with no usable line, are `Unusable`;
 `Unsupported`; I/O, a closed connection, EOF before the prompt and a prompt or reply past
 `MAX_REPLY` (64 KiB) are `Link`.
 
-Built against the runtime after its R1 re-gates (tracing-init `feat/bridge-runtime` 3128c96):
+Built against the runtime as landed on tracing-init master (fede590):
 `execute` takes `Option<&str>` (`ResetFilter` with none is Rejected), `DriverInfo` is built with
 `..DriverInfo::default()`, and `Bridge::run` installs the panic hook.
 

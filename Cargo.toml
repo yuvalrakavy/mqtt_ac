@@ -15,18 +15,15 @@ name = "mqtt_ac"
 path = "src/main.rs"
 
 [dependencies]
-# TODO: pin to the tracing-init git rev once R1 merges
-mqtt-bridge-kit = { path = "/Users/yuval/Documents/Projects/tracing-init-br/mqtt-bridge-kit" }
+mqtt-bridge-kit = { git = "https://github.com/yuvalrakavy/tracing-init.git", rev = "fede5907474239c3041e38dded2750994713fdcc" }
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "net", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
 # The fleet's test tools, from the same repository as the runtime (one revision for all).
-# TODO: pin to the tracing-init git rev once R1 merges
-mqtt-test-broker = { path = "/Users/yuval/Documents/Projects/tracing-init-br/mqtt-test-broker" }
-# TODO: pin to the tracing-init git rev once R1 merges
-wait-lint = { path = "/Users/yuval/Documents/Projects/tracing-init-br/wait-lint" }
+mqtt-test-broker = { git = "https://github.com/yuvalrakavy/tracing-init.git", rev = "fede5907474239c3041e38dded2750994713fdcc" }
+wait-lint = { git = "https://github.com/yuvalrakavy/tracing-init.git", rev = "fede5907474239c3041e38dded2750994713fdcc" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 # The driver tests' log capture (tests/support/log.rs).
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
