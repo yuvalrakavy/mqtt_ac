@@ -21,6 +21,8 @@
 # and the minors: seven rows added, three re-anchored): the first run 32 RED, 1 GREEN and
 # 2 WRONG-REASON, sharpened (b3c8d5a); then all 35 RED (4 min 44 s). After the owner's power-loss
 # decision (ef15ef7: the retraction row replaced by six): all 40 RED on the first run (5 min 56 s).
+# After the power review's fixes (24c7949: the power rows rewritten, the listing rows re-anchored):
+# all 48 RED on the first run (7 min 50 s).
 #
 # Failing first, beyond these rows: `one_bad_ls2_line_does_not_fail_the_listing` against 7c03022,
 # where the listing still parsed as v1's did — "L1.001's State was never published beside a bad
