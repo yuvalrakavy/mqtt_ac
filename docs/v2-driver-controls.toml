@@ -360,7 +360,7 @@ guard       = "lost_power_event"
 [[control]]
 name        = "no_power_restored_event"
 file        = "src/driver.rs"
-anchor      = '''                report.event(json!({ "kind": "unit_power_restored", "target": unit, "down_for_ms": down_for_ms }));'''
+anchor      = '''                report.event(event);'''
 replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "driver", "--", "a_unit_that_loses_power_is_reported_unpowered_and_restored", "--exact"]

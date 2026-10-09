@@ -120,13 +120,16 @@ async fn units_retained_powered_and_listed_say_nothing_after_a_restart() {
     let h = Harness::start_restarted(
         "restart-quiet",
         quick(Some(Duration::from_millis(200))),
-        |_| {},
+        // The CoolMaster is down until the bridge has subscribed to requests, which it does only
+        // once the read-back is complete: the first listing meets a seeded driver.
+        |cm| cm.set_up(false),
         |broker, topics| {
             retain_state(broker, topics, "L1.001", true);
             retain_state(broker, topics, "L1.002", true);
         },
     )
     .await;
+    h.coolmaster.set_up(true);
     assert!(h.connected().await);
     h.settle(Duration::from_millis(1000)).await;
     assert!(events(&h).is_empty(), "units listed after a restart produced Events: {:?}", events(&h));
