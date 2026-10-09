@@ -96,6 +96,10 @@ pub struct Coolmaster {
     passed_over: BTreeSet<String>,
     /// The units the full listings have named, for telling one gone (see [`Coolmaster::gone`]).
     known: BTreeMap<String, Known>,
+    /// When this driver began: a power-loss episode the previous run left open is counted from here.
+    started: Instant,
+    /// Whether the previous run's retained State has seeded `known` (see [`Coolmaster::seed`]), once.
+    seeded: bool,
     /// Each unit's scale at the CoolMaster, from its last usable line: a setpoint for a unit in
     /// °F goes in °F. For a unit not here, `apply` reads it first, and never guesses.
     scales: BTreeMap<String, protocol::Scale>,
@@ -116,6 +120,9 @@ struct Known {
     first_missed: Option<Instant>,
     /// Since when it has had no power — its first omission — during a power-loss episode.
     lost_since: Option<Instant>,
+    /// The episode was left open by the previous run (the retained State said `"powered": false`),
+    /// so `lost_since` is the restart, not an omission seen here.
+    since_restart: bool,
 }
 
 /// What a listing says about the units' power ([`Coolmaster::observe`]).
@@ -126,7 +133,17 @@ struct Observed {
     /// Units never established that are gone: ghosts, to retract quietly.
     vanished: Vec<String>,
     /// Units whose power is back, and how long it was gone.
-    restored: Vec<(String, Duration)>,
+    restored: Vec<Restored>,
+}
+
+/// A unit whose power is back.
+#[derive(Debug, PartialEq)]
+struct Restored {
+    unit: String,
+    /// How long it was gone: from its first omission, or from the restart when `since_restart`.
+    down: Duration,
+    /// The episode was open at the restart (the previous run's retained State said so).
+    since_restart: bool,
 }
 
 /// Usable full listings in a row that must omit a unit before it is taken for one that lost its
@@ -150,6 +167,8 @@ impl Coolmaster {
             operation_bound: info().timing.operation,
             passed_over: BTreeSet::new(),
             known: BTreeMap::new(),
+            started: Instant::now(),
+            seeded: false,
             scales: BTreeMap::new(),
         }
     }
@@ -198,7 +217,11 @@ impl Coolmaster {
             let known = self.known.entry(state.target.clone()).or_default();
             known.reported = true;
             if let Some(since) = known.lost_since.take() {
-                observed.restored.push((state.target.clone(), since.elapsed()));
+                observed.restored.push(Restored {
+                    unit: state.target.clone(),
+                    down: since.elapsed(),
+                    since_restart: std::mem::take(&mut known.since_restart),
+                });
             }
         }
         let certain = listing.bad.iter().all(|b| protocol::valid_unit(&b.unit));
@@ -250,7 +273,53 @@ impl Coolmaster {
     /// A per-unit listing's restorations (tests).
     #[cfg(test)]
     fn restored(&mut self, listing: &protocol::Listing) -> Vec<(String, Duration)> {
-        self.observe(listing, false).restored
+        self.observe(listing, false).restored.into_iter().map(|r| (r.unit, r.down)).collect()
+    }
+
+    /// Seed `known` from the previous run's retained State, once, at the first read-back that is
+    /// `complete` (the runtime's, frozen; checked at each listing until it is). What was retained is
+    /// the previous run's reports, never evidence from the CoolMaster, so a unit the listings have
+    /// already named stays as they left it. Otherwise:
+    /// - `"powered": false` starts an open episode, counted from the restart: when the unit is
+    ///   listed it is restored (`since_restart`), and no new loss is reported;
+    /// - `"powered": true` is an established unit: if usable full listings keep omitting it, it
+    ///   lost its power while the bridge was down.
+    ///
+    /// A unit listed before the seed (the read-back came late) whose retained State said
+    /// unpowered is restored here: it came back before the seed was made.
+    fn seed(&mut self) -> Vec<Restored> {
+        let mut restored = Vec::new();
+        if self.seeded {
+            return restored;
+        }
+        let Some(back) = self.handle.as_ref().map(LinkHandle::read_back).filter(|back| back.complete) else {
+            return restored;
+        };
+        self.seeded = true;
+        for (unit, values) in &back.targets {
+            let Some(powered) = values.get(protocol::POWERED).and_then(Value::as_bool) else {
+                continue;
+            };
+            if !protocol::valid_unit(unit) {
+                continue;
+            }
+            match self.known.get_mut(unit) {
+                Some(known) if known.reported => {
+                    if !powered && known.lost_since.is_none() {
+                        restored.push(Restored { unit: unit.clone(), down: self.started.elapsed(), since_restart: true });
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    let lost_since = (!powered).then_some(self.started);
+                    let missed = if powered { 0 } else { GONE_AFTER };
+                    let known =
+                        Known { reported: true, listed: GONE_AFTER, missed, lost_since, since_restart: !powered, ..Known::default() };
+                    self.known.insert(unit.clone(), known);
+                }
+            }
+        }
+        restored
     }
 
     /// Say which units a listing passed over: an INFO when a unit's line first cannot be used,
@@ -444,16 +513,22 @@ impl DeviceDriver for Coolmaster {
         let listing = protocol::parse_listing(&body);
         self.note(&listing);
         self.scales.extend(listing.scales.iter().map(|(unit, scale)| (unit.clone(), *scale)));
-        let observed = self.observe(&listing, unit.is_none());
+        let seeded = self.seed();
+        let mut observed = self.observe(&listing, unit.is_none());
+        observed.restored.extend(seeded);
         if let Some(report) = self.report() {
-            for (unit, down) in &observed.restored {
+            for Restored { unit, down, since_restart } in &observed.restored {
                 let down_for_ms = down.as_millis() as u64;
-                info!(kind = "unit_power_restored", unit = %unit, down_for_ms, "A unit the CoolMaster had stopped listing is listed again: its power is back");
+                info!(kind = "unit_power_restored", unit = %unit, down_for_ms, since_restart, "A unit the CoolMaster had stopped listing is listed again: its power is back");
                 // Its fresh State (`powered: true`) goes first, then the Event.
                 if let Some(state) = listing.states.iter().find(|s| &s.target == unit) {
                     report.state(unit, state.values.clone(), false);
                 }
-                report.event(json!({ "kind": "unit_power_restored", "target": unit, "down_for_ms": down_for_ms }));
+                let mut event = json!({ "kind": "unit_power_restored", "target": unit, "down_for_ms": down_for_ms });
+                if *since_restart {
+                    event["since_restart"] = json!(true);
+                }
+                report.event(event);
             }
             for unit in &observed.lost {
                 // Once per episode: `observe` names a unit only as its power goes.
