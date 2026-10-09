@@ -171,3 +171,41 @@ async fn an_incomplete_read_back_is_seeded_at_the_poll_that_finds_it_complete() 
     assert_eq!(lost, 1, "not one unit_lost_power Event: {:?}", events(&h));
     assert!(h.stop().await);
 }
+
+/// A unit retained `"powered": false` is listed BEFORE the seed is made (the read-back is still
+/// pending at the first listings): once the read-back completes, the seed finds the unit already
+/// listed and restores it, once, counted from the restart (`"since_restart": true`) — it came back
+/// before the seed was made — and never reports a loss.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unit_retained_unpowered_and_listed_before_the_seed_is_restored_at_the_seed() {
+    const UNIT: &str = "L1.074";
+    let h = Harness::start_restarted_unwaited(
+        "restart-listed-first",
+        quick(Some(Duration::from_millis(200))),
+        |cm| cm.add_unit(UNIT, units().remove("L1.002").unwrap()),
+        |broker, topics| {
+            retain_state(broker, topics, "L1.001", true);
+            retain_state(broker, topics, UNIT, false);
+            broker.hold_subacks();
+        },
+    )
+    .await;
+    // The driver lists the CoolMaster (the unit among its lines) several times, the read-back pending.
+    let listings = |h: &Harness| h.coolmaster.commands().iter().filter(|c| c.starts_with("ls2")).count();
+    assert!(h.eventually(BOUND, |h| listings(h) >= 5).await, "the driver did not poll while the read-back was pending");
+    assert!(restored(&h).is_empty(), "a unit was restored before the seed was made: {:?}", events(&h));
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(BOUND, |h| !restored(h).is_empty()).await,
+        "no unit_power_restored Event for a unit listed before the seed: {:?}",
+        events(&h)
+    );
+    h.settle(Duration::from_millis(800)).await;
+    let restored = restored(&h);
+    assert_eq!(restored.len(), 1, "not one unit_power_restored: {restored:?}");
+    assert_eq!(restored[0]["target"], UNIT);
+    assert_eq!(restored[0]["since_restart"], true, "the restore was not counted from the restart: {:?}", restored[0]);
+    assert!(h.state(UNIT).is_some_and(|s| s["powered"] == true), "the unit's power was not published back: {:?}", h.state(UNIT));
+    assert!(events(&h).iter().all(|e| e["kind"] != "unit_lost_power"), "the previous run's loss was reported again: {:?}", events(&h));
+    assert!(h.stop().await);
+}

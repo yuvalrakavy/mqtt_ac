@@ -687,6 +687,18 @@ argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--tes
 expect_text = '''was not counted from the restart'''
 guard       = "since_restart_marked"
 
+# A unit listed before the seed (the read-back came late), retained unpowered, not restored at
+# the seed: it came back before the seed was made, and nothing ever says so.
+[[control]]
+name        = "a_unit_listed_before_the_seed_is_not_restored"
+file        = "src/driver.rs"
+anchor      = '''                    if !powered && known.lost_since.is_none() {'''
+replacement = '''                    if false && !powered && known.lost_since.is_none() {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--target", "aarch64-apple-darwin", "--test", "restart", "--", "a_unit_retained_unpowered_and_listed_before_the_seed_is_restored_at_the_seed", "--exact"]
+expect_text = '''no unit_power_restored Event for a unit listed before the seed'''
+guard       = "listed_before_seed_restored"
+
 # Seeded at every listing, not once: a unit seeded as restored is restored again.
 [[control]]
 name        = "the_seed_is_made_at_every_listing"
