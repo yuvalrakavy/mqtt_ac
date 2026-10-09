@@ -124,7 +124,7 @@ mqtt_ac --instance <controller> --broker <host[:port]> --coolmaster <host[:port]
 - `--root` — the topics' root (default `Aircondition`).
 - The runtime's timing options: `--connect-timeout` (10 s), `--operation-timeout` (10 s), `--retry`
   (5 s), `--outage-warn` (30 s), `--poll` (4 s, or `off`), `--device-stable`, and the MQTT side's
-  `--mqtt-*`. (`--restore` is for one-way devices; the CoolMaster is read back, and leaves it off.)
+  `--mqtt-*`.
   `--log-config <path>` names tracing-init's `logging.toml` (otherwise it is found upward from the
   working directory). `--help` lists them all.
 

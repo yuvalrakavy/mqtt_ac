@@ -32,8 +32,7 @@ use crate::protocol;
 /// `ResetFilter`, and v1's timing — a connect and its prompt within 10 s, a retry every 5 s, one
 /// WARN past 30 s down, a listing every 4 s. v1 bounded each exchange at 10 s; the runtime bounds
 /// each operation, an `apply`'s few exchanges together, which a CoolMaster answers in milliseconds.
-/// Anything else `DriverInfo` holds keeps its default: `restore` stays off (the CoolMaster is read
-/// back, never restored from the read-back).
+/// Anything else `DriverInfo` holds keeps its default.
 pub fn info() -> DriverInfo {
     DriverInfo {
         writes: Writes::Acknowledged,

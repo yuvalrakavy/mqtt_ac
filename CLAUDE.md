@@ -74,7 +74,7 @@ that is not text or is empty, and a listing with no usable line, are `Unusable`;
 
 Built against the runtime after its R1 re-gates (tracing-init `feat/bridge-runtime` 3128c96):
 `execute` takes `Option<&str>` (`ResetFilter` with none is Rejected), `DriverInfo` is built with
-`..DriverInfo::default()` (`restore` stays false), and `Bridge::run` installs the panic hook.
+`..DriverInfo::default()`, and `Bridge::run` installs the panic hook.
 
 ## Tests
 
