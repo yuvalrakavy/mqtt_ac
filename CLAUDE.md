@@ -60,7 +60,13 @@ shutdown, the exit status), and logging. This crate keeps only the CoolMaster:
   then one Event `unit_power_restored` (`down_for_ms` from the first omission) and an INFO. A unit
   never established that vanishes is a ghost, retracted quietly. Every usable observation of a
   unit starts its omissions over; omissions count only on usable full listings; both counts are
-  capped at `GONE_AFTER`. `powered` is authoritative; the Events are best-effort (the runtime's
+  capped at `GONE_AFTER`. **Across a restart** (`seed`): `known` is seeded once from the runtime's
+  read-back (`LinkHandle::read_back()`, the previous run's retained State, not device evidence) at
+  the first listing where `complete` is true, checked at each poll until then, trusting the flag.
+  `powered:false` targets start in an open episode counted from the driver's start (restored with
+  `since_restart: true`, no new loss); `powered:true` ones are established, so a unit that lost power
+  while the bridge was down is reported lost. A unit the listings already named is left as they
+  left it. `powered` is authoritative; the Events are best-effort (the runtime's
   64-entry Event queue can displace them during an MQTT outage).
 - `src/main.rs` — the runtime's command line plus `--coolmaster` (a driver option, made required
   with `Bridge::require`; an address it cannot use is `Bridge::usage_error`, said by `usage_exit`).
@@ -93,6 +99,11 @@ Built against the runtime after its R1 re-gates (tracing-init `feat/bridge-runti
   a bad `ls2` line, a unit in failure, a unit losing its power and getting it back (and a garbled
   address, an empty or unusable listing changing no unit), the read-back stalled or dead, a °F
   unit, and the Store's own request shape.
+- `tests/restart.rs` — power-loss tracking across a restart: retained State put on the broker
+  before the bridge starts (`Harness::start_restarted`): a unit retained unpowered restored with
+  `since_restart`, one retained powered and omitted reported lost, retained-powered listed units
+  silent, and a read-back incomplete at the first polls (SUBACKs held, `start_restarted_unwaited`)
+  seeded once it is complete.
 - `tests/process.rs` — the binary: SIGTERM, `--coolmaster` usage errors, and `main` handing the
   driver `--operation-timeout` (a stalled read-back with a 1 s bound stays within it).
 - **Never** the live broker (`localhost:1883` on the Mac is the house), the LAN, or a real
@@ -120,11 +131,6 @@ runtime's file prefix is the application name); `logging.toml` adds GELF and Ope
 - **A garble that still reads as an address** (`L7.4O1` for `L7.401`) cannot be told from a real
   unit (re-gate R2, accepted): listed twice in a row in place of the real one, it is published as a
   unit and the real one taken for unpowered, until the garble ends.
-- **Power across a bridge restart** waits for the runtime's read-back accessor (`ctx.read_back()`,
-  coming): then `known` is seeded from the retained State — `powered:false` targets start in an
-  open episode (`since_restart: true`), `powered:true` ones count as established, so a unit that
-  lost power while the bridge was down is reported lost. Until then a unit never listed since the
-  start stays as its retained State says.
 
 **Temperatures:** State is in °C. A unit the CoolMaster lists in °F is converted, and a setpoint
 (asked in °C, 0–50) is sent to it in °F (`Scale`, from its last usable line). For a unit whose

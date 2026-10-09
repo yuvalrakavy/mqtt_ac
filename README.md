@@ -34,7 +34,7 @@ One process fronts one CoolMaster: the controller is the `{instance}`, an indoor
 | `{Root}/Desired/{controller}/{unit}` | Store → bridge | never | `{property: value, …}`: several at once |
 | `{Root}/Command/{controller}` | Store → bridge | never; 30 s expiry | `{"target": unit, "command": "ResetFilter"}`; the standard `refresh` and `assume` |
 | `{Root}/Config/{controller}/{unit}` | Store → bridge | yes | accepted; the CoolMaster needs no setup per unit |
-| `{Root}/Event/{controller}` | bridge → Store | no | `{"kind": "unit_lost_power", "target": unit}`, `{"kind": "unit_power_restored", "target": unit, "down_for_ms": N}`; replies to commands that ask for one (`"kind": "reply"`) |
+| `{Root}/Event/{controller}` | bridge → Store | no | `{"kind": "unit_lost_power", "target": unit}`, `{"kind": "unit_power_restored", "target": unit, "down_for_ms": N}` (plus `"since_restart": true` when the loss began before a restart of the bridge); replies to commands that ask for one (`"kind": "reply"`) |
 | `{Root}/Error/{controller}` | bridge → Store | no | `{error, reason, target?, property?, command?}` |
 
 QoS 1 everywhere. The bridge takes both `Desired` forms. **The Store's S1 driver sends only the
@@ -88,8 +88,15 @@ unit gone: its `State` is never retracted.
   is retained and republished on every reconnect.
 - **A controller reboot** that lists only part of its line for two polls or more (while it scans)
   shows as a burst of `unit_lost_power` Events and WARNs, then `unit_power_restored` ones: expected.
-- **Across a restart of the bridge:** a unit never listed since the bridge started stays as its
-  retained State says (the runtime's read-back of it is not yet handed to the driver).
+- **Across a restart of the bridge:** the driver is seeded from the runtime's read-back of the
+  previous run's retained State (the previous run's reports, not evidence from the CoolMaster),
+  once, at the first listing after the read-back is complete (checked at each poll until it is).
+  A unit retained `"powered": false` starts in an open episode: when it is listed, its fresh State
+  with `"powered": true` goes out, then one Event `unit_power_restored` with `down_for_ms` counted
+  from the restart and `"since_restart": true`, and an INFO; no new `unit_lost_power` for it. A unit
+  retained `"powered": true` counts as established, so a unit that lost power while the bridge was
+  down is reported lost like any other, once usable full listings keep omitting it. Retained values
+  never produce a restored Event for a unit that was not `powered: false`.
 
 ### What a request can set (`Desired`)
 
