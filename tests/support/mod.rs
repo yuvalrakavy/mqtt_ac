@@ -89,12 +89,25 @@ impl Harness {
 
     /// The same, after `prepare` has set the CoolMaster up for the bridge's first connection.
     pub async fn start_prepared(instance: &str, timing: TimingOverrides, prepare: impl FnOnce(&FakeCoolmaster)) -> Harness {
+        Harness::start_restarted(instance, timing, prepare, |_, _| {}).await
+    }
+
+    /// A bridge that is a restart: `prepare_broker` sets the broker up before the bridge starts
+    /// (given the topics, it can retain the previous run's `State`, or hold the SUBACKs), as
+    /// `prepare` sets the CoolMaster up.
+    pub async fn start_restarted(
+        instance: &str,
+        timing: TimingOverrides,
+        prepare: impl FnOnce(&FakeCoolmaster),
+        prepare_broker: impl FnOnce(&FakeBroker, &Topics),
+    ) -> Harness {
         log::install();
         let broker = FakeBroker::start().await;
         broker.cap_connections(50);
         let coolmaster = FakeCoolmaster::start().await;
         prepare(&coolmaster);
         let topics = Topics::new(ROOT, instance).expect("the test's topics");
+        prepare_broker(&broker, &topics);
         let address = Address::parse(&coolmaster.address).expect("the stand-in's address");
         let operation = timing.apply(mqtt_ac::info().timing).operation;
         let running = Bridge::new(ROOT)
