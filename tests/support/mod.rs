@@ -101,6 +101,27 @@ impl Harness {
         prepare: impl FnOnce(&FakeCoolmaster),
         prepare_broker: impl FnOnce(&FakeBroker, &Topics),
     ) -> Harness {
+        Harness::launch(instance, timing, prepare, prepare_broker, true).await
+    }
+
+    /// The same, without waiting for the bridge's subscription: for a broker that holds its
+    /// SUBACKs, where the bridge subscribes to requests only after the read-back's.
+    pub async fn start_restarted_unwaited(
+        instance: &str,
+        timing: TimingOverrides,
+        prepare: impl FnOnce(&FakeCoolmaster),
+        prepare_broker: impl FnOnce(&FakeBroker, &Topics),
+    ) -> Harness {
+        Harness::launch(instance, timing, prepare, prepare_broker, false).await
+    }
+
+    async fn launch(
+        instance: &str,
+        timing: TimingOverrides,
+        prepare: impl FnOnce(&FakeCoolmaster),
+        prepare_broker: impl FnOnce(&FakeBroker, &Topics),
+        wait: bool,
+    ) -> Harness {
         log::install();
         let broker = FakeBroker::start().await;
         broker.cap_connections(50);
@@ -119,8 +140,10 @@ impl Harness {
             .start(Coolmaster::new(address).operation_bound(operation))
             .expect("the bridge starts");
         let harness = Harness { broker, coolmaster, topics, running: Some(running) };
-        let command = harness.topics.command();
-        assert!(harness.broker.wait_for_subscription(&command, BOUND).await, "the bridge never subscribed to {command}");
+        if wait {
+            let command = harness.topics.command();
+            assert!(harness.broker.wait_for_subscription(&command, BOUND).await, "the bridge never subscribed to {command}");
+        }
         harness
     }
 

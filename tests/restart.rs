@@ -140,7 +140,7 @@ async fn units_retained_powered_and_listed_say_nothing_after_a_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_incomplete_read_back_is_seeded_at_the_poll_that_finds_it_complete() {
     const UNIT: &str = "L1.073";
-    let h = Harness::start_restarted(
+    let h = Harness::start_restarted_unwaited(
         "restart-late",
         quick(Some(Duration::from_millis(200))),
         |cm| {
@@ -153,10 +153,10 @@ async fn an_incomplete_read_back_is_seeded_at_the_poll_that_finds_it_complete() 
         },
     )
     .await;
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected") && h.state("L1.001").is_some()).await);
-    // Many polls with the read-back pending: the omitted unit is not established, so not lost.
-    h.settle(Duration::from_millis(1500)).await;
-    assert!(events(&h).is_empty(), "a unit was reported lost before the read-back was complete: {:?}", events(&h));
+    // The session publishes nothing while it waits for the read-back (5 s at most), but the driver
+    // polls: let it list the CoolMaster several times, the read-back pending at each.
+    let listings = |h: &Harness| h.coolmaster.commands().iter().filter(|c| c.starts_with("ls2")).count();
+    assert!(h.eventually(BOUND, |h| listings(h) >= 5).await, "the driver did not poll while the read-back was pending");
     h.broker.release_subacks();
     assert!(
         h.eventually(BOUND, |h| h.state(UNIT).is_some_and(|s| s["powered"] == false)).await,
