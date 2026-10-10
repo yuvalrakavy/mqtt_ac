@@ -32,7 +32,7 @@ cargo fmt                                                # rustfmt.toml: wide, l
 ```
 
 The runtime, `mqtt-test-broker` and `wait-lint` are git dependencies on tracing-init, pinned to one
-`rev` (fede590, `Cargo.toml`).
+`rev` (69a42b9, `Cargo.toml`).
 
 ## Architecture
 
